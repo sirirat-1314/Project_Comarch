@@ -1,0 +1,1449 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CPU Pipeline Hazard Fighter</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Noto+Sans+Thai:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  :root {
+    --bg: #05060d;
+    --panel: #090c18;
+    --panel-2: #0d1222;
+    --line: #1c2745;
+    --text: #dbe6ff;
+    --dim: #8795b8;
+    --neon: #39ff14;
+    --red: #ff1744;
+    --amber: #ffc400;
+    --cyan: #00e5ff;
+    /* สีประจำแต่ละด่าน (ไม่ใช้สีแดง เพราะแดงสงวนไว้ให้ Hazard) */
+    --c-if: #00e5ff;
+    --c-id: #c77dff;
+    --c-ex: #39ff14;
+    --c-mem: #ffc400;
+    --c-wb: #5b9bff;
+    --font-ui: 'Chakra Petch', 'Noto Sans Thai', sans-serif;
+    --font-code: 'IBM Plex Mono', ui-monospace, monospace;
+  }
+  html { background: var(--bg); }
+  body {
+    margin: 0; color: var(--text); font-family: 'Noto Sans Thai', var(--font-ui);
+    background:
+      radial-gradient(1100px 520px at 12% -10%, rgba(57,255,20,.07), transparent 60%),
+      radial-gradient(900px 500px at 100% 0%, rgba(255,23,68,.06), transparent 60%),
+      linear-gradient(rgba(255,255,255,.022) 1px, transparent 1px) 0 0 / 100% 34px,
+      var(--bg);
+    min-height: 100vh;
+  }
+  .ui { font-family: var(--font-ui); }
+  .code { font-family: var(--font-code); }
+  .panel { background: linear-gradient(180deg, var(--panel-2), var(--panel)); border: 1px solid var(--line); border-radius: 6px; }
+  .panel-title { font-family: var(--font-ui); font-weight: 600; font-size: .95rem; letter-spacing: .02em; color: var(--neon); }
+  :focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+
+  /* ---------- Title ---------- */
+  .brand { font-family: var(--font-ui); font-weight: 700; letter-spacing: .01em; line-height: 1; text-shadow: 0 0 18px rgba(57,255,20,.45); }
+  .brand b { color: var(--red); text-shadow: 0 0 18px rgba(255,23,68,.7); font-weight: 700; }
+
+  /* ---------- Score ---------- */
+  .tile { padding: .55rem .8rem; border-left: 2px solid var(--line); min-width: 0; }
+  .tile .k { font-size: .72rem; color: var(--dim); }
+  .tile .v { font-family: var(--font-ui); font-weight: 700; font-size: 1.35rem; line-height: 1.15; font-variant-numeric: tabular-nums; }
+  .tile.score { border-left-color: var(--neon); }
+  .tile.score .v { font-size: 2rem; color: var(--neon); text-shadow: 0 0 14px rgba(57,255,20,.55); }
+  .pop { animation: pop .35s ease-out; }
+  @keyframes pop { 0% { transform: scale(1.18); } 100% { transform: scale(1); } }
+  .bar { height: 8px; background: #121a31; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: var(--neon); box-shadow: 0 0 10px var(--neon); transition: width .3s, background .3s; }
+  .bar > i.mid { background: var(--amber); box-shadow: 0 0 10px var(--amber); }
+  .bar > i.low { background: var(--red); box-shadow: 0 0 10px var(--red); }
+
+  /* ---------- Status banner ---------- */
+  .status { border-radius: 6px; padding: .8rem 1rem; border: 1px solid; transition: background .2s, border-color .2s; }
+  .status .t { font-family: var(--font-ui); font-weight: 700; font-size: 1.5rem; line-height: 1.1; }
+  .status .s { font-size: .88rem; margin-top: .3rem; color: var(--text); }
+  .status .s div + div { margin-top: .15rem; }
+  .status.safe { border-color: rgba(57,255,20,.45); background: rgba(57,255,20,.06); }
+  .status.safe .t { color: var(--neon); text-shadow: 0 0 12px rgba(57,255,20,.5); }
+  .status.danger { border-color: var(--red); animation: hazardBlink 0.9s ease-in-out infinite; }
+  .status.danger .t { color: #ff5a78; text-shadow: 0 0 14px rgba(255,23,68,.8); }
+  .status.end { border-color: var(--cyan); background: rgba(0,229,255,.07); }
+  .status.end .t { color: var(--cyan); }
+  .hint { color: var(--amber); }
+
+  /* ---------- Live pipeline ---------- */
+  .stages { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 14px; }
+  .stage { position: relative; background: #070a15; border: 1px solid color-mix(in srgb, var(--sc) 55%, #0b1020); border-top: 3px solid var(--sc);
+    border-radius: 5px; min-height: 132px; padding: .55rem .65rem .6rem; --sc: var(--c-if); overflow: hidden; }
+  .stage[data-s="IF"] { --sc: var(--c-if); } .stage[data-s="ID"] { --sc: var(--c-id); }
+  .stage[data-s="EX"] { --sc: var(--c-ex); } .stage[data-s="MEM"] { --sc: var(--c-mem); } .stage[data-s="WB"] { --sc: var(--c-wb); }
+  .stage:not(:last-child)::after { content: ''; position: absolute; right: -11px; top: 50%; width: 8px; height: 8px; margin-top: -4px;
+    border-top: 2px solid var(--dim); border-right: 2px solid var(--dim); transform: rotate(45deg); }
+  .stage .h { display: flex; align-items: baseline; justify-content: space-between; gap: .4rem; }
+  .stage .h b { font-family: var(--font-ui); font-size: 1.15rem; color: var(--sc); text-shadow: 0 0 10px color-mix(in srgb, var(--sc) 60%, transparent); }
+  .stage .h span { font-size: .68rem; color: var(--dim); text-align: right; }
+  .stage .op { font-family: var(--font-code); font-weight: 600; font-size: 1.4rem; margin-top: .55rem; color: var(--text); }
+  .stage .args { font-family: var(--font-code); font-size: .8rem; color: var(--dim); margin-top: .1rem; word-break: break-word; }
+  .stage .no { position: absolute; right: .55rem; bottom: .4rem; font-family: var(--font-code); font-size: .72rem; color: var(--dim); }
+  .stage .tag { position: absolute; left: .65rem; bottom: .4rem; font-family: var(--font-code); font-size: .7rem; font-weight: 600; }
+  .stage.bubble .op { color: var(--dim); }
+  .stage.stallb { background: repeating-linear-gradient(135deg, rgba(255,196,0,.09) 0 8px, transparent 8px 16px), #070a15; }
+  .stage.stallb .op { color: var(--amber); }
+  .stage.flushb { background: repeating-linear-gradient(135deg, rgba(255,23,68,.1) 0 8px, transparent 8px 16px), #070a15; }
+  .stage.flushb .op { color: #ff6b84; text-decoration: line-through; text-decoration-thickness: 2px; }
+  .stage.enter .body { animation: slidein .28s ease-out; }
+  @keyframes slidein { from { transform: translateX(-22px); opacity: 0; } to { transform: none; opacity: 1; } }
+  .stage.hz { border-color: var(--red); border-top-color: var(--red); animation: hazardBlink .8s ease-in-out infinite; }
+  .stage.hz .tag { color: #ff5a78; }
+  .stage.fwd { border-color: var(--cyan); box-shadow: 0 0 0 1px var(--cyan), 0 0 16px rgba(0,229,255,.35); }
+  .stage.fwd .tag { color: var(--cyan); }
+  .stage .corrupt { color: #ff5a78; font-size: .72rem; font-weight: 600; }
+  @keyframes hazardBlink {
+    0%, 100% { background-color: rgba(255,23,68,.14); box-shadow: 0 0 0 1px var(--red), 0 0 14px rgba(255,23,68,.55); }
+    50%      { background-color: rgba(255,23,68,.55); box-shadow: 0 0 0 2px var(--red), 0 0 36px rgba(255,23,68,.95); }
+  }
+  .strip { min-height: 30px; display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .7rem; }
+  .chip { font-family: var(--font-code); font-size: .74rem; padding: .15rem .5rem; border-radius: 3px; border: 1px solid; }
+  .chip.fwd { color: var(--cyan); border-color: rgba(0,229,255,.6); background: rgba(0,229,255,.08); }
+  .chip.flush { color: #ff8da1; border-color: rgba(255,23,68,.6); background: rgba(255,23,68,.08); }
+  .chip.stall { color: var(--amber); border-color: rgba(255,196,0,.6); background: rgba(255,196,0,.08); }
+  .chip.stale { color: #fff; border-color: var(--red); background: rgba(255,23,68,.45); }
+  .chip.ok { color: var(--neon); border-color: rgba(57,255,20,.6); background: rgba(57,255,20,.08); }
+
+  /* ---------- Buttons ---------- */
+  .btn { font-family: var(--font-ui); font-weight: 700; font-size: 1.15rem; padding: .95rem 1rem; border-radius: 6px; border: 2px solid; cursor: pointer;
+    background: #060914; transition: transform .06s, box-shadow .15s, background .15s; text-align: center; line-height: 1.2; }
+  .btn small { display: block; font-family: 'Noto Sans Thai', var(--font-ui); font-weight: 400; font-size: .74rem; margin-top: .2rem; opacity: .85; }
+  .btn:active:not(:disabled) { transform: translateY(2px) scale(.99); }
+  .btn:disabled { opacity: .38; cursor: not-allowed; }
+  .btn.next { color: var(--neon); border-color: var(--neon); }
+  .btn.next:hover:not(:disabled) { background: rgba(57,255,20,.12); box-shadow: 0 0 22px rgba(57,255,20,.45); }
+  .btn.stall { color: var(--amber); border-color: var(--amber); }
+  .btn.stall:hover:not(:disabled) { background: rgba(255,196,0,.12); box-shadow: 0 0 22px rgba(255,196,0,.4); }
+  .btn.fwd { color: var(--cyan); border-color: var(--cyan); }
+  .btn.fwd:hover:not(:disabled) { background: rgba(0,229,255,.12); box-shadow: 0 0 22px rgba(0,229,255,.4); }
+  .btn.fwd.on { background: rgba(0,229,255,.14); box-shadow: 0 0 18px rgba(0,229,255,.35); opacity: 1; }
+  .kbd { font-family: var(--font-code); font-size: .7rem; border: 1px solid currentColor; border-radius: 3px; padding: 0 .3rem; margin-left: .35rem; opacity: .8; }
+  .ghost { font-size: .82rem; color: var(--dim); background: transparent; border: 1px solid var(--line); border-radius: 4px; padding: .3rem .7rem; cursor: pointer; }
+  .ghost:hover { color: var(--text); border-color: var(--dim); }
+
+  /* ---------- Code list ---------- */
+  #code-list { position: relative; overflow-y: auto; scroll-behavior: auto; max-height: calc(100vh - 150px); min-height: 260px; padding: .3rem 0 .6rem; }
+  .sec { font-family: var(--font-ui); font-size: .78rem; color: var(--dim); padding: .6rem .8rem .2rem 2.3rem; }
+  .row { display: grid; grid-template-columns: 1.4rem 1.7rem 4.3rem 1fr auto; align-items: center; gap: .2rem; padding: .22rem .6rem .22rem .4rem;
+    font-family: var(--font-code); font-size: .84rem; border-left: 3px solid transparent; position: relative; }
+  .row .ptr { color: var(--neon); font-size: .95rem; visibility: hidden; text-shadow: 0 0 10px var(--neon); }
+  .row .ln { color: #53627f; text-align: right; }
+  .row .lbl { color: var(--cyan); font-size: .76rem; padding-left: .3rem; white-space: nowrap; }
+  .row .asm { color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .asm .op { color: #ff9ff3; font-weight: 600; }
+  .row .asm .rg { color: #9dffb0; }
+  .row .chips { display: flex; gap: 3px; }
+  .row .chips i { font-style: normal; font-size: .62rem; font-weight: 600; padding: 0 .3rem; border-radius: 2px; border: 1px solid; line-height: 1.3; }
+  .row.next { background: linear-gradient(90deg, rgba(57,255,20,.2), rgba(57,255,20,.03)); border-left-color: var(--neon); }
+  .row.next .ptr { visibility: visible; animation: nudge .9s ease-in-out infinite; }
+  @keyframes nudge { 0%, 100% { transform: translateX(0); } 50% { transform: translateX(4px); } }
+  .row.haz { background: rgba(255,23,68,.18); border-left-color: var(--red); }
+  .row.haz.next { background: linear-gradient(90deg, rgba(255,23,68,.25), rgba(57,255,20,.05)); }
+  .fetchnote { font-size: .72rem; color: var(--neon); font-family: var(--font-code); padding: 0 .8rem; }
+
+  /* ---------- Matrix ---------- */
+  #matrix-wrap { overflow: auto; max-height: 360px; }
+  table.mx { border-collapse: separate; border-spacing: 3px; font-family: var(--font-code); font-size: .72rem; }
+  table.mx th { font-weight: 500; color: var(--dim); text-align: center; padding: 0 0 2px; min-width: 44px; position: sticky; top: 0; background: var(--panel-2); z-index: 2; }
+  table.mx thead th { box-shadow: 0 -3px 0 var(--panel-2), 0 3px 0 var(--panel-2); }   /* บังช่องว่างไม่ให้แถวที่เลื่อนลอดขึ้นมาใต้หัวตาราง */
+  table.mx th.cur { color: var(--neon); }
+  table.mx th.lab { text-align: left; position: sticky; left: 0; z-index: 3; min-width: 190px; max-width: 190px; background: var(--panel-2); color: var(--text);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-right: 6px; font-size: .76rem; }
+  table.mx thead th.lab { z-index: 4; }
+  table.mx th.lab.stall { color: var(--amber); }
+  table.mx th.lab.flushed { color: #ff8da1; text-decoration: line-through; }
+  table.mx td { padding: 0; height: 26px; }
+  .cell { height: 26px; line-height: 24px; text-align: center; border-radius: 3px; font-weight: 600; border: 1px solid; font-size: .72rem; }
+  .cell.IF { color: var(--c-if); border-color: rgba(0,229,255,.5); background: rgba(0,229,255,.1); }
+  .cell.ID { color: var(--c-id); border-color: rgba(199,125,255,.5); background: rgba(199,125,255,.1); }
+  .cell.EX { color: var(--c-ex); border-color: rgba(57,255,20,.5); background: rgba(57,255,20,.1); }
+  .cell.MEM { color: var(--c-mem); border-color: rgba(255,196,0,.5); background: rgba(255,196,0,.1); }
+  .cell.WB { color: var(--c-wb); border-color: rgba(91,155,255,.5); background: rgba(91,155,255,.1); }
+  .cell.flushed { color: #ff8da1; border-color: rgba(255,23,68,.4); background: repeating-linear-gradient(135deg, rgba(255,23,68,.16) 0 5px, transparent 5px 10px); }
+  .cell.stalled { color: var(--amber); border-color: rgba(255,196,0,.4); background: repeating-linear-gradient(135deg, rgba(255,196,0,.16) 0 5px, transparent 5px 10px); }
+  .cell.hz-past { border-color: var(--red); color: #ff8da1; background: rgba(255,23,68,.25); }
+  .cell.hz-now { border-color: var(--red); color: #fff; animation: hazardBlink .8s ease-in-out infinite; }
+  .cell.fwdc { box-shadow: 0 0 0 1px var(--cyan), 0 0 8px rgba(0,229,255,.5); }
+  .legend { display: flex; flex-wrap: wrap; gap: .3rem .9rem; font-size: .74rem; color: var(--dim); }
+  .legend span::before { content: ''; display: inline-block; width: .7rem; height: .7rem; margin-right: .35rem; vertical-align: -1px; border-radius: 2px; background: var(--k); }
+
+  /* ---------- Regs & log ---------- */
+  .regs { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 6px; }
+  .reg { font-family: var(--font-code); font-size: .78rem; border: 1px solid var(--line); border-radius: 4px; padding: .25rem .45rem; display: flex; justify-content: space-between; gap: .4rem; background: #070a15; }
+  .reg span { color: var(--dim); }
+  .reg b { font-weight: 600; font-variant-numeric: tabular-nums; }
+  .reg.changed { animation: regflash .9s ease-out; }
+  @keyframes regflash { 0% { background: rgba(57,255,20,.5); border-color: var(--neon); } 100% { background: #070a15; } }
+  #log { max-height: 190px; overflow-y: auto; font-family: var(--font-code); font-size: .76rem; display: flex; flex-direction: column; gap: 2px; }
+  #log div { padding: 1px 0; border-bottom: 1px solid #10172c; }
+  #log .c { color: #5b6a8c; margin-right: .5rem; }
+  #log .good { color: var(--neon); } #log .bad { color: #ff6b84; } #log .info { color: var(--cyan); } #log .warn { color: var(--amber); } #log .sys { color: var(--dim); }
+
+  /* ---------- Overlay ---------- */
+  #overlay { position: fixed; inset: 0; background: rgba(3,4,10,.86); display: none; align-items: center; justify-content: center; z-index: 50; padding: 1rem; backdrop-filter: blur(3px); }
+  #overlay.show { display: flex; }
+  #overlay .box { width: min(720px, 100%); max-height: 94vh; overflow-y: auto; border: 1px solid var(--neon); box-shadow: 0 0 44px rgba(57,255,20,.25); background: var(--panel); border-radius: 8px; padding: 1.4rem 1.5rem; }
+  #overlay.bad .box { border-color: var(--red); box-shadow: 0 0 44px rgba(255,23,68,.35); }
+  .rank { font-family: var(--font-ui); font-weight: 700; font-size: 5rem; line-height: 1; }
+  #overlay.win .box { width: min(860px, 100%); box-shadow: 0 0 60px rgba(57,255,20,.35); }
+  .win-title { font-family: var(--font-ui); font-weight: 700; font-size: clamp(1.6rem, 4.2vw, 2.4rem); line-height: 1.2; color: var(--neon); text-shadow: 0 0 22px rgba(57,255,20,.6); }
+  .card { background: #070a15; border: 1px solid var(--line); border-radius: 6px; padding: .8rem .9rem; }
+  .card .ck { font-size: .8rem; color: var(--dim); }
+  .card .cv { font-family: var(--font-ui); font-weight: 700; font-size: 2.2rem; line-height: 1.1; margin: .15rem 0 .4rem; font-variant-numeric: tabular-nums; }
+  .card .cv small { font-size: .9rem; font-weight: 500; color: var(--dim); }
+  .card .cl { display: flex; justify-content: space-between; gap: .6rem; font-size: .82rem; padding: .18rem 0; border-top: 1px solid #10172c; }
+  .card .cl span { color: var(--text); } .card .cl b { font-family: var(--font-code); font-weight: 600; white-space: nowrap; }
+  .card .cl.sub span { color: var(--dim); padding-left: .8rem; }
+  .meter { height: 6px; background: #121a31; border-radius: 3px; overflow: hidden; margin-bottom: .45rem; }
+  .meter i { display: block; height: 100%; border-radius: 3px; }
+  #fx { position: fixed; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 60; }
+  .big { font-family: var(--font-ui); font-weight: 700; font-size: 1.7rem; }
+  .how li { margin: .35rem 0; }
+  .how b { color: var(--neon); font-weight: 600; }
+  .how .a { color: var(--amber); } .how .c { color: var(--cyan); } .how .r { color: #ff6b84; }
+
+  @media (max-width: 900px) {
+    .stages { grid-template-columns: 1fr; gap: 10px; }
+    .stage { min-height: 0; padding-bottom: 1.8rem; }
+    .stage:not(:last-child)::after { display: none; }
+    #code-list { max-height: 300px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+    .stage.hz, .status.danger, .cell.hz-now { background-color: rgba(255,23,68,.4); box-shadow: 0 0 0 2px var(--red), 0 0 18px rgba(255,23,68,.8); }
+  }
+
+  /* ---------- Pre-game Tutorial ---------- */
+  #tutorial-container { min-height: 100vh; display: grid; place-items: center; padding: 1.25rem; overflow: hidden;
+    background: radial-gradient(circle at 15% 10%, rgba(0,229,255,.17), transparent 31%), radial-gradient(circle at 85% 90%, rgba(255,23,68,.15), transparent 34%), #05060d; }
+  .tutorial-shell { width: min(1040px, 100%); min-height: min(680px, calc(100vh - 2.5rem)); position: relative; overflow: hidden; border: 1px solid rgba(0,229,255,.5); border-radius: 18px;
+    background: linear-gradient(145deg, rgba(13,18,34,.98), rgba(5,6,13,.98)); box-shadow: 0 0 0 1px rgba(57,255,20,.12), 0 0 55px rgba(0,229,255,.16); }
+  .tutorial-shell::before { content: ''; position: absolute; inset: 0; pointer-events: none; opacity: .2; background: linear-gradient(90deg, transparent 49.8%, #00e5ff 50%, transparent 50.2%) 0 0 / 80px 80px, linear-gradient(transparent 49.8%, #00e5ff 50%, transparent 50.2%) 0 0 / 80px 80px; mask-image: linear-gradient(to bottom, black, transparent); }
+  .tutorial-slide { display: none; position: relative; z-index: 1; min-height: min(680px, calc(100vh - 2.5rem)); padding: clamp(1.5rem, 5vw, 4rem); grid-template-rows: auto 1fr auto; gap: 1.5rem; }
+  .tutorial-slide.active { display: grid; animation: tutorialIn .35s ease-out; }
+  @keyframes tutorialIn { from { opacity: 0; transform: translateX(18px); } to { opacity: 1; transform: none; } }
+  .tutorial-kicker { color: var(--cyan); font: 600 .78rem var(--font-code); letter-spacing: .16em; }
+  .tutorial-title { margin: .4rem 0 0; font: 700 clamp(2rem, 6vw, 4.2rem)/1 var(--font-ui); color: #fff; text-shadow: 0 0 24px rgba(0,229,255,.35); }
+  .tutorial-lede { max-width: 720px; margin: .8rem 0 0; color: var(--dim); font-size: clamp(1rem, 2vw, 1.18rem); }
+  .tutorial-grid { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 1rem; align-content: center; }
+  .tutorial-card { padding: 1.1rem; border: 1px solid var(--line); border-radius: 10px; background: rgba(5,10,21,.75); }
+  .tutorial-card h3 { margin: 0 0 .45rem; color: var(--neon); font: 700 1.1rem var(--font-ui); } .tutorial-card p { margin: 0; color: var(--text); line-height: 1.6; }
+  .tutorial-code { display: block; margin-top: .8rem; padding: .65rem; border-left: 2px solid var(--cyan); color: #b8f8ff; background: #050914; font: .82rem/1.6 var(--font-code); }
+  .pipeline-flow { display: grid; grid-template-columns: repeat(5, 1fr); gap: .5rem; align-items: center; }
+  .pipeline-flow div { min-height: 118px; padding: .7rem; border: 1px solid var(--pc); border-top: 4px solid var(--pc); border-radius: 7px; background: rgba(5,10,21,.8); color: var(--pc); font: 700 1.25rem var(--font-ui); } .pipeline-flow small { display: block; margin-top: .45rem; color: var(--text); font: .76rem/1.35 'Noto Sans Thai', sans-serif; }
+  .tutorial-bottom { display: flex; justify-content: space-between; align-items: end; gap: 1rem; } .tutorial-citation { max-width: 65%; color: #7180a5; font: .7rem/1.4 var(--font-code); }
+  .tutorial-btn { min-width: 150px; padding: .75rem 1rem; color: var(--neon); border: 1px solid var(--neon); border-radius: 6px; background: rgba(57,255,20,.07); cursor: pointer; font: 700 1rem var(--font-ui); } .tutorial-btn:hover { box-shadow: 0 0 22px rgba(57,255,20,.45); background: rgba(57,255,20,.16); }
+  .tutorial-btn.start { color: #061009; background: var(--neon); } .tutorial-btn.start:hover { background: #8cff78; }
+  @media (max-width: 720px) { .tutorial-grid, .pipeline-flow { grid-template-columns: 1fr; } .pipeline-flow div { min-height: 0; } .tutorial-bottom { align-items: flex-start; flex-direction: column-reverse; } .tutorial-citation { max-width: none; } }
+</style>
+</head>
+<body>
+<div id="tutorial-container" aria-label="บทเรียนก่อนเริ่มเกม">
+  <section class="tutorial-shell" aria-live="polite">
+    <article class="tutorial-slide active" data-tutorial-slide="0">
+      <header><div class="tutorial-kicker">PRE-GAME TUTORIAL · 01 / 03</div><h1 class="tutorial-title">พื้นฐาน MIPS</h1><p class="tutorial-lede">คิดว่า CPU มี “ลิ้นชักเล็ก ๆ” สำหรับเก็บตัวเลขที่กำลังใช้งานอยู่ ลิ้นชักเหล่านี้เรียกว่า Register</p></header>
+      <div class="tutorial-grid"><div class="tutorial-card"><h3>Register คืออะไร?</h3><p>เป็นที่เก็บข้อมูลขนาดเล็กและเร็วมากใน CPU เช่น <code>$t0</code> สำหรับค่าชั่วคราว และ <code>$s0</code> สำหรับค่าที่อยากเก็บไว้</p></div><div class="tutorial-card"><h3>คำสั่งคำนวณ</h3><p><code>add</code> บวก, <code>sub</code> ลบ, <code>addi</code> บวกตัวเลขคงที่</p><span class="tutorial-code">addi $t0, $zero, 5<br>→ ใส่เลข 5 ลงใน $t0</span></div><div class="tutorial-card"><h3>คำสั่งอ่าน/ตัดสินใจ</h3><p><code>lw</code> อ่านข้อมูลจากความจำ, <code>sw</code> เขียนข้อมูลลงความจำ, <code>beq</code> เลือกกระโดดเมื่อค่าเท่ากัน</p></div></div>
+      <footer class="tutorial-bottom"><small class="tutorial-citation">แหล่งอ้างอิง: COA Notes 2014, บทที่ 2 - MIPS registers และคำสั่งพื้นฐาน</small><button class="tutorial-btn" data-tutorial-next>ต่อไป: Pipeline →</button></footer>
+    </article>
+    <article class="tutorial-slide" data-tutorial-slide="1">
+      <header><div class="tutorial-kicker">PRE-GAME TUTORIAL · 02 / 03</div><h2 class="tutorial-title">5-Stage Pipeline</h2><p class="tutorial-lede">เหมือนสายพานโรงงาน: คำสั่งหลายชิ้นทำงานคนละขั้นพร้อมกัน จึงทำงานได้ต่อเนื่องขึ้น</p></header>
+      <div class="pipeline-flow" aria-label="ขั้นตอน IF ID EX MEM WB"><div style="--pc:var(--c-if)">IF<small>หยิบคำสั่งถัดไป</small></div><div style="--pc:var(--c-id)">ID<small>อ่านและแปลคำสั่ง</small></div><div style="--pc:var(--c-ex)">EX<small>คำนวณหรือเปรียบเทียบ</small></div><div style="--pc:var(--c-mem)">MEM<small>อ่าน/เขียนความจำ</small></div><div style="--pc:var(--c-wb)">WB<small>บันทึกผลกลับ Register</small></div></div>
+      <footer class="tutorial-bottom"><small class="tutorial-citation">แหล่งอ้างอิง: COA Notes 2014, บทที่ 5, หน้า 117-120 - Pipelining</small><button class="tutorial-btn" data-tutorial-next>ต่อไป: Hazards →</button></footer>
+    </article>
+    <article class="tutorial-slide" data-tutorial-slide="2">
+      <header><div class="tutorial-kicker">PRE-GAME TUTORIAL · 03 / 03</div><h2 class="tutorial-title">Pipeline Hazards</h2><p class="tutorial-lede">บางครั้งสายพานเร็วเกินไปจนคำสั่งถัดไปต้องการข้อมูลที่คำสั่งก่อนหน้ายังทำไม่เสร็จ นี่คือ Hazard</p></header>
+      <div class="tutorial-grid"><div class="tutorial-card"><h3>Data Hazard</h3><p>คำสั่งใหม่รีบใช้ผลลัพธ์เก่า เช่น <code>add</code> เพิ่งคำนวณ แต่คำสั่งถัดไปอยากอ่านผลทันที</p><span class="tutorial-code">แก้: Forwarding ส่งผลลัพธ์ผ่านทางลัด<br>หรือ NOP เพื่อรอ 1 รอบ</span></div><div class="tutorial-card"><h3>Control Hazard</h3><p>เกิดเมื่อเจอ <code>beq</code> หรือ <code>j</code> แต่ CPU ยังไม่รู้ว่าต้องไปทางไหน จึงอาจหยิบคำสั่งผิดทางมาแล้ว</p><span class="tutorial-code">แก้: ล้างคำสั่งผิดทาง (flush)<br>แล้วเริ่มอ่านคำสั่งจากทางที่ถูก</span></div><div class="tutorial-card"><h3>ภารกิจของคุณ</h3><p>ในเกม ให้มอง Hazard สีแดง เปิด Forwarding สำหรับการคำนวณ และใส่ NOP เมื่อต้องรอข้อมูลจาก <code>lw</code></p></div></div>
+      <footer class="tutorial-bottom"><small class="tutorial-citation">แหล่งอ้างอิง: COA Notes 2014, บทที่ 5.1, หน้า 121-129 - Data/Control Hazards, stall และ forwarding</small><button class="tutorial-btn start" id="start-game-btn">Start Game ⚡</button></footer>
+    </article>
+  </section>
+</div>
+<div id="game-container" style="display: none;">
+<div class="mx-auto w-full max-w-[1640px] px-3 sm:px-5 py-4">
+
+  <!-- ===== Header + Score ===== -->
+  <header class="flex flex-col gap-3 xl:flex-row xl:items-end xl:justify-between mb-4">
+    <div class="min-w-0">
+      <h1 class="brand text-3xl sm:text-4xl">CPU Pipeline <b>Hazard</b> Fighter</h1>
+      <p class="text-sm mt-2" style="color:var(--dim)">ด่านหลัก: คำนวณ nCr = n! / (r! · (n−r)!) ด้วย n = 5, r = 2 บน MIPS 5-Stage Pipeline</p>
+    </div>
+    <section class="panel grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-y-2 py-1 xl:min-w-[900px]" aria-label="คะแนน">
+      <div class="tile score col-span-2 sm:col-span-1"><div class="k">คะแนน</div><div class="v" id="v-score">0</div></div>
+      <div class="tile"><div class="k">คอมโบ</div><div class="v" id="v-combo">×1.0</div></div>
+      <div class="tile col-span-2 sm:col-span-1"><div class="k">ความเสถียรของ Pipeline</div><div class="bar mt-2"><i id="bar-int" style="width:100%"></i></div><div class="code text-xs mt-1" id="v-int">100%</div></div>
+      <div class="tile"><div class="k">Cycle</div><div class="v" id="v-cycle">0</div></div>
+      <div class="tile"><div class="k">CPI</div><div class="v" id="v-cpi">–</div></div>
+      <div class="tile"><div class="k">Stall</div><div class="v" id="v-stall">0</div></div>
+      <div class="tile"><div class="k">Flush</div><div class="v" id="v-flush">0</div></div>
+      <div class="tile"><div class="k">Forward</div><div class="v" id="v-fwd">0</div></div>
+    </section>
+  </header>
+
+  <div class="grid gap-4 lg:grid-cols-[minmax(340px,430px)_minmax(0,1fr)]">
+
+    <!-- ===== LEFT: Assembly ===== -->
+    <aside class="panel lg:sticky lg:top-3 self-start" aria-label="โค้ด MIPS Assembly">
+      <div class="flex items-center justify-between px-4 pt-3 pb-1">
+        <h2 class="panel-title">โปรแกรม nCr (MIPS)</h2>
+        <span class="fetchnote" id="fetchnote"></span>
+      </div>
+      <div id="code-list" role="list"></div>
+    </aside>
+
+    <!-- ===== RIGHT ===== -->
+    <main class="flex flex-col gap-4 min-w-0">
+
+      <div id="status" class="status safe" role="status" aria-live="polite">
+        <div class="t" id="status-t">ระบบทำงานปกติ (Safe)</div>
+        <div class="s" id="status-s"></div>
+      </div>
+
+      <section class="panel p-4" aria-label="Pipeline ปัจจุบัน">
+        <div class="stages" id="stages"></div>
+        <div class="strip" id="strip" aria-live="polite"></div>
+      </section>
+
+      <section class="grid gap-3 sm:grid-cols-3" aria-label="ปุ่มควบคุม">
+        <button class="btn next" id="btn-next">Next Cycle<span class="kbd">N</span><small>เดินหน้า 1 clock</small></button>
+        <button class="btn stall" id="btn-stall">Insert Stall (NOP)<span class="kbd">S</span><small>แทรก NOP แล้วเดิน 1 clock</small></button>
+        <button class="btn fwd" id="btn-fwd">Enable Forwarding<span class="kbd">F</span><small>เปิดสายลัด EX/MEM → EX</small></button>
+      </section>
+      <div class="flex flex-wrap items-center gap-3 -mt-2">
+        <label class="flex items-center gap-2 text-sm cursor-pointer" style="color:var(--dim)"><input type="checkbox" id="hints" checked> แสดงคำแนะนำ</label>
+        <button class="ghost" id="btn-how">วิธีเล่น</button>
+        <button class="ghost" id="btn-restart">เริ่มใหม่</button>
+      </div>
+
+      <section class="panel p-4" aria-label="Pipeline Matrix">
+        <div class="flex flex-wrap items-baseline justify-between gap-2 mb-2">
+          <h2 class="panel-title">Pipeline Matrix</h2>
+          <div class="legend">
+            <span style="--k:var(--c-if)">IF</span><span style="--k:var(--c-id)">ID</span><span style="--k:var(--c-ex)">EX</span>
+            <span style="--k:var(--c-mem)">MEM</span><span style="--k:var(--c-wb)">WB</span>
+            <span style="--k:var(--amber)">NOP (stall)</span><span style="--k:var(--red)">Hazard / ถูกล้าง</span>
+          </div>
+        </div>
+        <div id="matrix-wrap"><div id="matrix" class="code text-xs" style="color:var(--dim)">กด Next Cycle เพื่อเริ่ม</div></div>
+      </section>
+
+      <div class="grid gap-4 xl:grid-cols-2">
+        <section class="panel p-4" aria-label="Register">
+          <div class="flex items-baseline justify-between mb-2">
+            <h2 class="panel-title">Register</h2>
+            <span class="text-xs" style="color:var(--dim)">เป้าหมาย: $v0 = 10</span>
+          </div>
+          <div class="regs" id="regs"></div>
+        </section>
+        <section class="panel p-4" aria-label="บันทึกเหตุการณ์">
+          <h2 class="panel-title mb-2">บันทึกเหตุการณ์</h2>
+          <div id="log"></div>
+        </section>
+      </div>
+    </main>
+  </div>
+</div>
+
+<!-- ===== Overlay: วิธีเล่น / สรุปผล ===== -->
+<div id="overlay" role="dialog" aria-modal="true" aria-labelledby="ov-title"><div class="box" id="ov-box"></div></div>
+<canvas id="fx" aria-hidden="true"></canvas>
+</div>
+
+<!-- ===== Core Logic (pipeline_core.js) ===== -->
+<script>
+/* =====================================================================
+ * CPU Pipeline Hazard Fighter — Core Logic (MIPS 5-Stage Pipeline)
+ * ---------------------------------------------------------------------
+ * ใช้คู่กับ nCrProgram จาก ncr_program.js:
+ *
+ *   const sim = new PipelineSimulator(nCrProgram);
+ *   sim.checkHazard();     // ดูว่าตอนนี้มี Hazard อะไรบ้าง
+ *   sim.insertStall();     // ผู้เล่นกดปุ่ม "แทรก NOP"
+ *   sim.enableForwarding();// ผู้เล่นกดปุ่ม "เปิดสายลัด"
+ *   sim.nextCycle();       // เดินหน้า 1 clock
+ *
+ * แนวคิดสำคัญ
+ *  - Simulator "รันคำสั่งจริง" (มี register file / memory / LO / HI) ไม่ใช่แค่แอนิเมชัน
+ *    ดังนั้นถ้าผู้เล่นปล่อย Hazard ผ่านไป ค่าจะผิดจริง (stale read) และผลลัพธ์ nCr เพี้ยนจริง
+ *  - Register file เขียนครึ่งแรกของ cycle / อ่านครึ่งหลัง  => producer ที่อยู่ WB ไม่ชน ID
+ *    ดังนั้น Data Hazard เกิดเมื่อ producer อยู่ที่ EX หรือ MEM ขณะที่ consumer อยู่ ID
+ *  - Forwarding ต่อเข้า "อินพุตของ EX" จาก 2 สาย: EX/MEM (producer อยู่ MEM) และ MEM/WB (producer อยู่ WB)
+ *    ถ้า producer เป็น lw ที่ยังอยู่ EX ข้อมูลยังไม่ออกจาก memory => forward ไม่ทัน ต้อง stall 1 รอบ (Load-Use)
+ *  - Control Hazard: ไม่มี branch prediction (fetch ตามลำดับเสมอ)
+ *      j   รู้ปลายทางที่ ID  => คำสั่งที่ถูก fetch ผิดทาง 1 คำสั่งถูกล้าง (penalty 1 cycle)
+ *      beq ตัดสินที่ EX      => ถ้า taken ล้างคำสั่งผิดทาง 2 คำสั่ง (penalty 2 cycles)
+ *    การล้าง (flush) เป็นฮาร์ดแวร์อัตโนมัติ ผู้เล่นไม่ต้องกดอะไร แต่ถูกนับเป็นรอบที่เสียไป
+ *  - "j <ตัวเอง>" (เช่น  end: j end) ถือเป็นจุดจบโปรแกรม (HALT) ไม่วนไม่รู้จบ
+ * ===================================================================== */
+(function (root) {
+  'use strict';
+
+  const STAGES = ['IF', 'ID', 'EX', 'MEM', 'WB'];
+  const ZERO = 'zero';
+
+  /* -------------------------------------------------------------------
+   * 1) Decode: แปลงข้อความ assembly -> โครงสร้างที่ simulator ใช้
+   *    reads / writes ถูก "คำนวณจาก assembly" (ไม่พึ่งฟิลด์ในไฟล์) เพื่อกันข้อมูลไม่ตรงกัน
+   * ------------------------------------------------------------------- */
+  function decodeInstruction(raw, index, labelToId) {
+    const m = raw.assembly.trim().match(/^(\w+)\s*(.*)$/);
+    if (!m) throw new Error('อ่านคำสั่งไม่ได้: ' + raw.assembly);
+    const op = m[1].toLowerCase();
+    const args = m[2] ? m[2].split(',').map((s) => s.trim()) : [];
+    const R = (s) => s.replace(/^\$/, '');
+
+    const ins = {
+      id: raw.id, index, op, assembly: raw.assembly, label: raw.label || null,
+      rs: null, rt: null, rd: null, imm: 0,
+      reads: [], writes: [],
+      isLoad: false, isStore: false, isBranch: false, isJump: false,
+      target: null, targetIndex: null,
+    };
+    let labelName = null;
+
+    switch (op) {
+      case 'add': case 'sub': case 'mul':          // op rd, rs, rt
+        ins.rd = R(args[0]); ins.rs = R(args[1]); ins.rt = R(args[2]);
+        ins.reads = [ins.rs, ins.rt]; ins.writes = [ins.rd]; break;
+      case 'addi':                                 // addi rt, rs, imm
+        ins.rt = R(args[0]); ins.rs = R(args[1]); ins.imm = parseInt(args[2], 10);
+        ins.reads = [ins.rs]; ins.writes = [ins.rt]; break;
+      case 'lw': case 'sw': {                      // lw/sw rt, imm(rs)
+        const mm = args[1].match(/^(-?\d+)\(\$(\w+)\)$/);
+        if (!mm) throw new Error('รูปแบบ address ผิด: ' + raw.assembly);
+        ins.rt = R(args[0]); ins.imm = parseInt(mm[1], 10); ins.rs = mm[2];
+        if (op === 'lw') { ins.isLoad = true; ins.reads = [ins.rs]; ins.writes = [ins.rt]; }
+        else { ins.isStore = true; ins.reads = [ins.rs, ins.rt]; ins.writes = []; }
+        break;
+      }
+      case 'beq':                                  // beq rs, rt, label
+        ins.rs = R(args[0]); ins.rt = R(args[1]); labelName = args[2];
+        ins.isBranch = true; ins.reads = [ins.rs, ins.rt]; break;
+      case 'j':                                    // j label
+        labelName = args[0]; ins.isJump = true; break;
+      case 'div':                                  // div rs, rt  -> LO, HI
+        ins.rs = R(args[0]); ins.rt = R(args[1]);
+        ins.reads = [ins.rs, ins.rt]; ins.writes = ['LO', 'HI']; break;
+      case 'mflo':                                 // mflo rd
+        ins.rd = R(args[0]); ins.reads = ['LO']; ins.writes = [ins.rd]; break;
+      default:
+        throw new Error('ยังไม่รองรับคำสั่ง: ' + op);
+    }
+
+    if (ins.isBranch || ins.isJump) {
+      ins.target = raw.target != null ? raw.target : labelToId[labelName];
+      if (ins.target == null) throw new Error('หา target ไม่เจอ: ' + raw.assembly);
+    }
+    return ins;
+  }
+
+  /* -------------------------------------------------------------------
+   * 2) PipelineSimulator
+   * ------------------------------------------------------------------- */
+  class PipelineSimulator {
+    /**
+     * @param {Array}  program  อาร์เรย์ของ { id, assembly, label?, target? }
+     * @param {Object} options
+     *   forwarding    : เริ่มต้นเปิดสายลัดหรือไม่ (default false)
+     *   autoInterlock : true = ฮาร์ดแวร์ stall ให้เองเมื่อเจอ Hazard (ไว้ทดสอบ/โหมดสอน)
+     *                   false = ผู้เล่นต้องแก้เอง ไม่งั้นข้อมูลผิด (default)
+     *   maxCycles     : กันวนไม่รู้จบเมื่อข้อมูลเพี้ยน (default 5000)
+     *   sp            : ค่าเริ่มต้นของ $sp
+     */
+    constructor(program, options = {}) {
+      this.opts = {
+        forwarding: !!options.forwarding,
+        autoInterlock: !!options.autoInterlock,
+        maxCycles: options.maxCycles != null ? options.maxCycles : 5000,
+        sp: options.sp != null ? options.sp : 0x7fffeffc,
+      };
+
+      const labelToId = {};
+      const idToIndex = {};
+      program.forEach((p, i) => {
+        if (idToIndex[p.id] !== undefined) throw new Error('id ซ้ำ: ' + p.id);
+        idToIndex[p.id] = i;
+        if (p.label) labelToId[p.label] = p.id;
+      });
+      this.program = program.map((p, i) => decodeInstruction(p, i, labelToId));
+      this.program.forEach((ins) => {
+        if (ins.target != null) {
+          if (idToIndex[ins.target] === undefined) throw new Error('target ไม่มีในโปรแกรม: ' + ins.assembly);
+          ins.targetIndex = idToIndex[ins.target];
+        }
+      });
+      this.reset();
+    }
+
+    /* ---------- สถานะเริ่มต้น ---------- */
+    reset() {
+      this.cycle = 0;              // จำนวน clock ที่ผ่านไป (state ปัจจุบัน = cycle นี้)
+      this.pc = 0;                 // index ของคำสั่งถัดไปที่จะ fetch
+      this.uidSeq = 0;
+      this.regs = {};                                   // ทุก reg ที่โปรแกรมใช้เริ่มที่ 0 (UI จะได้มีครบ)
+      this.program.forEach((i) => i.reads.concat(i.writes).forEach((r) => (this.regs[r] = 0)));
+      this.regs.sp = this.opts.sp; this.regs.LO = 0; this.regs.HI = 0;
+      this.mem = new Map();
+      this.forwarding = this.opts.forwarding;
+      this.autoInterlock = this.opts.autoInterlock;
+      this.stallRequests = 0;      // จำนวน NOP ที่ผู้เล่นสั่งไว้ (ใช้ทีละ 1 ต่อ clock)
+      this.fetchStopped = false;   // true หลังเจอ HALT
+      this.halted = false;
+      this.timedOut = false;
+      this.pipe = {};
+      STAGES.forEach((s) => (this.pipe[s] = this._bubble('EMPTY')));
+      this.stats = {
+        cycles: 0, retired: 0,
+        stalls: 0, wastedStalls: 0,   // wasted = ผู้เล่นสั่ง stall ทั้งที่ไม่มี Hazard
+        flushed: 0,                    // จำนวนคำสั่งที่ถูกล้างจาก Control Hazard
+        forwards: 0,                   // จำนวนครั้งที่สายลัดทำงานจริง
+        staleReads: 0,                 // จำนวนครั้งที่อ่านค่าเก่า (Hazard ที่ไม่ได้แก้)
+      };
+      this.eventLog = [];
+      this.timeline = [];
+      this._record();
+    }
+
+    /* ---------- ตัวช่วยสร้างคำสั่ง / bubble ---------- */
+    _inst(ins) {
+      return { uid: ++this.uidSeq, bubble: false, ins, operands: {}, results: {},
+        taken: null, addr: null, storeValue: null, corrupted: false, flushed: false };
+    }
+    // kind: 'EMPTY' (ว่าง) | 'STALL' (NOP ที่ผู้เล่น/ฮาร์ดแวร์แทรก) | 'FLUSH' (ถูกล้างจาก Control Hazard)
+    _bubble(kind, ghost) {
+      return { uid: ++this.uidSeq, bubble: true, kind, ins: null, results: {}, ghost: ghost || null };
+    }
+    // ล้างคำสั่งผิดทาง: ของจริง -> กลายเป็น bubble FLUSH, ถ้าเป็น bubble อยู่แล้วปล่อยผ่าน
+    _squash(inst, events) {
+      if (inst.bubble) return inst;
+      inst.flushed = true;
+      this.stats.flushed++;
+      events.push({ type: 'FLUSH', cycle: this.cycle, instruction: brief(inst) });
+      return this._bubble('FLUSH', inst.ins);
+    }
+
+    /* =================================================================
+     * checkHazard(): ตรวจ state "ปัจจุบัน" (ยังไม่ขยับ clock)
+     *   - Data Hazard (RAW): คำสั่งใน ID ต้องการ reg ที่ producer ใน EX หรือ MEM ยังเขียนไม่เสร็จ
+     *   - Control Hazard   : คำสั่งใน ID เป็น j / beq
+     * ================================================================= */
+    checkHazard() {
+      const id = this.pipe.ID;
+      const report = { cycle: this.cycle, data: [], control: null,
+        stallsNeeded: 0, needsAction: false, hasHazard: false };
+      if (id.bubble) return report;
+
+      for (const reg of new Set(id.ins.reads)) {      // Set: add $t1,$t0,$t0 นับ $t0 ครั้งเดียว
+        if (reg === ZERO) continue;
+        // หา producer ที่ "ใหม่ที่สุด" ก่อน: EX แล้วค่อย MEM (WB ไม่ชน เพราะเขียนครึ่งแรก)
+        let producer = null, stage = null;
+        for (const s of ['EX', 'MEM']) {
+          const cand = this.pipe[s];
+          if (!cand.bubble && cand.ins.writes.includes(reg)) { producer = cand; stage = s; break; }
+        }
+        if (!producer) continue;
+
+        const loadUse = producer.ins.isLoad && stage === 'EX';
+        const fixedByForwarding = this.forwarding && !loadUse;
+        let stallsNeeded;
+        if (fixedByForwarding) stallsNeeded = 0;
+        else if (this.forwarding) stallsNeeded = 1;          // Load-Use: ต้องรอให้ lw ไปอยู่ MEM ก่อนจึง forward ได้
+        else stallsNeeded = stage === 'EX' ? 2 : 1;          // ไม่มีสายลัด: ต้องรอจน producer ถึง WB
+
+        report.data.push({
+          type: 'RAW', reg, producerStage: stage, loadUse,
+          producer: brief(producer), consumer: brief(id),
+          resolvedByForwarding: fixedByForwarding, stallsNeeded,
+          message: (loadUse ? 'Load-Use: ' : 'RAW: ') + '$' + reg + ' จาก "' + producer.ins.assembly +
+            '" (อยู่ที่ ' + stage + ') ยังเขียนไม่เสร็จ',
+        });
+        report.stallsNeeded = Math.max(report.stallsNeeded, stallsNeeded);
+      }
+
+      if (id.ins.isJump || id.ins.isBranch) {
+        report.control = {
+          type: 'CONTROL', kind: id.ins.isJump ? 'JUMP' : 'BRANCH',
+          instruction: brief(id),
+          resolveStage: id.ins.isJump ? 'ID' : 'EX',
+          penaltyCycles: id.ins.isJump ? 1 : 2,      // beq: จ่ายก็ต่อเมื่อ taken
+          certain: id.ins.isJump,                     // j แน่นอนว่ากระโดด, beq รู้ผลตอน EX
+          message: id.ins.isJump
+            ? 'Control: "' + id.ins.assembly + '" กระโดดเสมอ คำสั่งที่ fetch ไว้ผิดทางจะถูกล้าง (เสีย 1 รอบ)'
+            : 'Control: "' + id.ins.assembly + '" รู้ผลตอน EX ถ้า taken จะล้างคำสั่งผิดทาง 2 คำสั่ง (เสีย 2 รอบ)',
+        };
+      }
+
+      report.needsAction = report.stallsNeeded > 0;
+      report.hasHazard = report.data.length > 0 || report.control !== null;
+      return report;
+    }
+
+    /* =================================================================
+     * ปุ่มของผู้เล่น
+     * ================================================================= */
+
+    /** แทรก NOP 1 ตัว: clock ถัดไป คำสั่งใน ID + IF จะค้างอยู่ที่เดิม (PC ไม่ขยับ)
+     *  และมี bubble (NOP) ไหลเข้า EX แทน — นี่คือ pipeline stall มาตรฐาน */
+    insertStall() {
+      this.stallRequests++;
+      const r = this.checkHazard();
+      return { ok: true, queued: this.stallRequests, useful: r.stallsNeeded > 0, report: r };
+    }
+
+    /** เปิดสายลัด EX/MEM และ MEM/WB -> อินพุตของ EX
+     *  แก้ RAW ที่เกิดจากคำสั่ง ALU ได้ทันที แต่ Load-Use ยังต้อง stall 1 รอบ */
+    enableForwarding() {
+      const already = this.forwarding;
+      this.forwarding = true;
+      const r = this.checkHazard();
+      return {
+        ok: true, alreadyEnabled: already,
+        fixed: r.data.filter((h) => h.resolvedByForwarding),
+        stillNeedsStall: r.stallsNeeded > 0, stallsNeeded: r.stallsNeeded, report: r,
+      };
+    }
+    disableForwarding() { this.forwarding = false; return { ok: true }; }
+
+    /* =================================================================
+     * nextCycle(): เดินหน้า 1 clock
+     * ลำดับงานใน clock เดียว (สำคัญ!):
+     *   EX -> MEM -> WB -> ID -> IF
+     *   - EX ทำก่อน MEM เพื่อให้ lw ที่ยังอยู่ MEM "ยังไม่มีข้อมูล" ให้ forward (ตรงกับฮาร์ดแวร์จริง)
+     *   - WB เขียน register ก่อน ID อ่าน (เขียนครึ่งแรก / อ่านครึ่งหลัง)
+     * ================================================================= */
+    nextCycle() {
+      if (this.status() !== 'RUNNING') return this._result([]);
+
+      const cur = this.pipe;
+      const events = [];
+      const report = this.checkHazard();
+
+      // --- ตัดสินใจว่า clock นี้จะ stall ไหม (ผู้เล่นสั่ง หรือโหมด autoInterlock) ---
+      let stall = false, stallSource = null;
+      if (this.stallRequests > 0) { this.stallRequests--; stall = true; stallSource = 'PLAYER'; }
+      else if (this.autoInterlock && report.stallsNeeded > 0) { stall = true; stallSource = 'AUTO'; }
+
+      // --- EX: เลือก operand (forward ถ้าเปิดสายลัด) แล้วคำนวณ / ตัดสิน beq ---
+      let exRedirect = null;
+      if (!cur.EX.bubble) {
+        this._execute(cur.EX, cur, events);
+        if (cur.EX.ins.isBranch && cur.EX.taken) exRedirect = cur.EX.ins.targetIndex;
+      }
+      // --- MEM / WB ---
+      if (!cur.MEM.bubble) this._memory(cur.MEM);
+      if (!cur.WB.bubble) this._writeBack(cur.WB);
+
+      // beq taken: ID/IF เป็นคำสั่งผิดทางอยู่แล้ว การ stall ไม่มีความหมาย
+      if (exRedirect !== null && stall) {
+        stall = false;
+        events.push({ type: 'STALL_DROPPED', cycle: this.cycle });
+      }
+
+      // --- ID: อ่าน register file (เฉพาะเมื่อคำสั่งเดินต่อ) + ตัดสิน j ---
+      let idRedirect = null;
+      if (exRedirect === null && !stall && !cur.ID.bubble) {
+        const id = cur.ID;
+        for (const r of id.ins.reads) id.operands[r] = r === ZERO ? 0 : (this.regs[r] || 0);
+        if (id.ins.isJump) {
+          idRedirect = id.ins.targetIndex;
+          if (id.ins.target === id.ins.id) this.fetchStopped = true;   // j ตัวเอง = HALT
+        }
+      }
+
+      // --- บันทึกเหตุการณ์ stall ---
+      if (stall) {
+        const useful = report.stallsNeeded > 0;
+        this.stats.stalls++;
+        if (!useful) this.stats.wastedStalls++;
+        events.push({ type: 'STALL', cycle: this.cycle, source: stallSource, useful });
+      }
+      if (report.control && exRedirect === null && idRedirect !== null) {
+        events.push({ type: 'CONTROL_HAZARD', cycle: this.cycle, instruction: report.control.instruction, penalty: 1 });
+      }
+
+      // --- เลื่อน pipeline ---
+      const next = { WB: cur.MEM, MEM: cur.EX };
+      if (exRedirect !== null) {
+        // beq taken ที่ EX: ล้าง ID และ IF (penalty 2)
+        events.push({ type: 'CONTROL_HAZARD', cycle: this.cycle, instruction: brief(cur.EX), penalty: 2 });
+        next.EX = this._squash(cur.ID, events);
+        next.ID = this._squash(cur.IF, events);
+        this.pc = exRedirect;
+        next.IF = this._fetch();
+      } else if (stall) {
+        next.EX = this._bubble('STALL');
+        next.ID = cur.ID;           // ค้างไว้
+        next.IF = cur.IF;           // ค้างไว้ (PC ไม่ขยับ)
+      } else {
+        next.EX = cur.ID;
+        if (idRedirect !== null) {  // j: ล้างคำสั่งที่ fetch ผิดทางใน IF (penalty 1)
+          next.ID = this._squash(cur.IF, events);
+          this.pc = idRedirect;
+        } else {
+          next.ID = cur.IF;
+        }
+        next.IF = this._fetch();
+      }
+
+      this.pipe = next;
+      this.cycle++;
+      this.stats.cycles = this.cycle;
+
+      // HALT: เมื่อ "j end" เข้าถึง WB ถือว่าจบ (ไม่มีอะไรให้เขียนกลับ)
+      const wb = next.WB;
+      if (!wb.bubble && wb.ins.isJump && wb.ins.target === wb.ins.id) {
+        this._writeBack(wb);
+        this.halted = true;
+      }
+      if (!this.halted && this.cycle >= this.opts.maxCycles) this.timedOut = true;
+
+      this.eventLog.push(...events);
+      this._record();
+      return this._result(events);
+    }
+
+    /* ---------- IF ---------- */
+    _fetch() {
+      if (this.fetchStopped || this.pc < 0 || this.pc >= this.program.length) return this._bubble('EMPTY');
+      return this._inst(this.program[this.pc++]);
+    }
+
+    /* ---------- EX ---------- */
+    _execute(inst, cur, events) {
+      const ins = inst.ins;
+      const v = {};                              // ค่า operand ที่ใช้จริง
+      for (const reg of ins.reads) {
+        if (reg === ZERO) { v[reg] = 0; continue; }
+        let value = inst.operands[reg];          // ค่าที่อ่านไว้ตอน ID (อาจเก่า!)
+        // producer ที่ยังไม่ commit ลง register file = อยู่ MEM หรือ WB ในตอนนี้
+        // (ถ้ามี แปลว่าตอน ID เราอ่านค่าเก่ามา — ใหม่ที่สุดต้องมาก่อน)
+        const prod = this._findProducer(reg, [cur.MEM, cur.WB]);
+        if (prod) {
+          const ready = prod.results[reg] !== undefined;     // lw ที่ยังอยู่ MEM -> ยังไม่พร้อม
+          if (this.forwarding && ready) {
+            value = prod.results[reg];
+            this.stats.forwards++;
+            events.push({ type: 'FORWARD', cycle: this.cycle, reg,
+              path: prod === cur.MEM ? 'EX/MEM' : 'MEM/WB',
+              from: brief(prod), to: brief(inst) });
+          } else {
+            inst.corrupted = true;
+            this.stats.staleReads++;
+            events.push({ type: 'STALE_READ', cycle: this.cycle, reg,
+              reason: this.forwarding ? 'LOAD_USE' : 'NO_FORWARDING',
+              instruction: brief(inst), producer: brief(prod) });
+          }
+        }
+        v[reg] = value;
+      }
+
+      switch (ins.op) {
+        case 'add':  inst.results[ins.rd] = (v[ins.rs] + v[ins.rt]) | 0; break;
+        case 'sub':  inst.results[ins.rd] = (v[ins.rs] - v[ins.rt]) | 0; break;
+        case 'mul':  inst.results[ins.rd] = Math.imul(v[ins.rs], v[ins.rt]); break;
+        case 'addi': inst.results[ins.rt] = (v[ins.rs] + ins.imm) | 0; break;
+        case 'div':
+          if (v[ins.rt] === 0) { inst.results.LO = 0; inst.results.HI = 0; }   // MIPS: ไม่นิยาม
+          else { inst.results.LO = (v[ins.rs] / v[ins.rt]) | 0; inst.results.HI = v[ins.rs] % v[ins.rt]; }
+          break;
+        case 'mflo': inst.results[ins.rd] = v.LO; break;
+        case 'lw':   inst.addr = (v[ins.rs] + ins.imm) | 0; break;           // ข้อมูลมาตอน MEM
+        case 'sw':   inst.addr = (v[ins.rs] + ins.imm) | 0; inst.storeValue = v[ins.rt]; break;
+        case 'beq':  inst.taken = v[ins.rs] === v[ins.rt]; break;
+        case 'j':    inst.taken = true; break;
+      }
+    }
+
+    _findProducer(reg, stageInsts) {
+      for (const s of stageInsts) if (!s.bubble && s.ins.writes.includes(reg)) return s;
+      return null;
+    }
+
+    /* ---------- MEM ---------- */
+    _memory(inst) {
+      if (inst.ins.isLoad) inst.results[inst.ins.rt] = this.mem.has(inst.addr) ? this.mem.get(inst.addr) : 0;
+      else if (inst.ins.isStore) this.mem.set(inst.addr, inst.storeValue);
+    }
+
+    /* ---------- WB ---------- */
+    _writeBack(inst) {
+      for (const [reg, val] of Object.entries(inst.results)) if (reg !== ZERO) this.regs[reg] = val;
+      this.stats.retired++;
+    }
+
+    /* =================================================================
+     * Snapshot สำหรับ UI
+     * ================================================================= */
+    status() { return this.halted ? 'FINISHED' : this.timedOut ? 'TIMEOUT' : 'RUNNING'; }
+
+    getState() {
+      const pipeline = {};
+      STAGES.forEach((s) => (pipeline[s] = view(this.pipe[s])));
+      const st = this.stats;
+      return {
+        cycle: this.cycle, status: this.status(), forwarding: this.forwarding,
+        pendingStalls: this.stallRequests,
+        // คำสั่งที่กำลังจะถูก fetch ใน clock ถัดไป (null = หยุด fetch แล้ว / หมดโปรแกรม)
+        nextFetchId: !this.fetchStopped && this.program[this.pc] ? this.program[this.pc].id : null,
+        pipeline, regs: { ...this.regs },
+        stats: { ...st, cpi: st.retired ? +(st.cycles / st.retired).toFixed(2) : null },
+        hazard: this.checkHazard(),
+      };
+    }
+
+    _result(events) { return { cycle: this.cycle, status: this.status(), events, state: this.getState() }; }
+
+    // ตารางไทม์ไลน์สำหรับวาด Pipeline Diagram: timeline[k] = ของ cycle k
+    _record() {
+      const cell = (i) => (i.bubble ? (i.kind === 'STALL' ? 'stall' : i.kind === 'FLUSH' ? 'flush' : null) : i.ins.id);
+      const row = { cycle: this.cycle };
+      STAGES.forEach((s) => (row[s] = cell(this.pipe[s])));
+      this.timeline.push(row);
+    }
+
+    /** เรียกซ้ำจนจบ (ใช้ทดสอบ / ปุ่ม "Auto run") */
+    run(maxSteps = Infinity) {
+      let n = 0;
+      while (this.status() === 'RUNNING' && n++ < maxSteps) this.nextCycle();
+      return this.getState();
+    }
+
+    /** เทียบ register กับค่าที่คาดหวัง เช่น nCrExpected */
+    verify(expected) {
+      const diffs = [];
+      for (const [reg, want] of Object.entries(expected)) {
+        const got = this.regs[reg] || 0;
+        if (got !== want) diffs.push({ reg, want, got });
+      }
+      return { ok: diffs.length === 0, diffs };
+    }
+  }
+
+  /* ---------- helper: ข้อมูลย่อของคำสั่ง ---------- */
+  function brief(inst) { return inst.bubble ? null : { uid: inst.uid, id: inst.ins.id, assembly: inst.ins.assembly }; }
+  function view(inst) {
+    if (inst.bubble) {
+      return { bubble: true, uid: inst.uid, kind: inst.kind, id: null,
+        assembly: inst.kind === 'STALL' ? 'NOP (stall)' : inst.kind === 'FLUSH' ? 'NOP (flushed)' : '—',
+        ghost: inst.ghost ? inst.ghost.assembly : null };   // ghost = คำสั่งที่ถูกล้าง (ไว้ทำเอฟเฟกต์)
+    }
+    return { bubble: false, uid: inst.uid, id: inst.ins.id, assembly: inst.ins.assembly,
+      corrupted: inst.corrupted };
+  }
+
+  const api = { PipelineSimulator, decodeInstruction, STAGES };
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  else Object.assign(root, api);
+})(typeof globalThis !== 'undefined' ? globalThis : this);
+
+</script>
+<!-- ===== โจทย์ nCr (ncr_program.js) ===== -->
+<script>
+// CPU Pipeline Hazard Fighter - ด่านหลัก: nCr = n! / (r! * (n-r)!)
+// ค่าเริ่มต้น n=5, r=2  -> ผลลัพธ์ที่ถูกต้อง $v0 = 10
+//
+// ข้อตกลงของฟิลด์ (ตรงกับ MIPS encoding):
+//  - R-type : rs, rt = แหล่งข้อมูล, rd = ปลายทาง
+//  - I-type (addi, lw) : rs = แหล่งข้อมูล, rt = ปลายทาง
+//  - I-type (sw, beq)  : rs, rt = แหล่งข้อมูลทั้งคู่ (ไม่มีปลายทางที่เป็นรีจิสเตอร์)
+//  - reads / writes : รายการรีจิสเตอร์ที่อ่าน/เขียนจริง (ใช้ตรวจ Data Hazard ในเกมได้ตรง ๆ)
+//  - target : id ของคำสั่งปลายทางสำหรับ beq / j
+//  - hazard : เฉลยสำหรับให้ระบบเกมตรวจคำตอบ (RAW, LOAD_USE, CONTROL)
+
+const nCrProgram = [
+  // ---------- Setup ----------
+  { id: 1,  label: null,    assembly: "addi $a0, $zero, 5",  rs: "zero", rt: "a0", rd: null, type: "I", reads: ["zero"],       writes: ["a0"], hazard: null },
+  { id: 2,  label: null,    assembly: "addi $a1, $zero, 2",  rs: "zero", rt: "a1", rd: null, type: "I", reads: ["zero"],       writes: ["a1"], hazard: null },
+  { id: 3,  label: null,    assembly: "sub $s0, $a0, $a1",   rs: "a0",   rt: "a1", rd: "s0", type: "R", reads: ["a0", "a1"],   writes: ["s0"], hazard: "RAW: a1 จากคำสั่ง 2 (ห่าง 1), a0 จากคำสั่ง 1 (ห่าง 2)" },
+
+  // ---------- n! -> $s1 ----------
+  { id: 4,  label: null,    assembly: "addi $s1, $zero, 1",  rs: "zero", rt: "s1", rd: null, type: "I", reads: ["zero"],       writes: ["s1"], hazard: null },
+  { id: 5,  label: null,    assembly: "add $t0, $zero, $a0", rs: "zero", rt: "a0", rd: "t0", type: "R", reads: ["zero", "a0"], writes: ["t0"], hazard: null },
+  { id: 6,  label: "loopN", assembly: "beq $t0, $zero, doneN", rs: "t0", rt: "zero", rd: null, type: "I", reads: ["t0", "zero"], writes: [], target: 10, hazard: "CONTROL + RAW: t0 จากคำสั่ง 5 (รอบแรก) / คำสั่ง 8 (รอบถัดไป)" },
+  { id: 7,  label: null,    assembly: "mul $s1, $s1, $t0",   rs: "s1",   rt: "t0", rd: "s1", type: "R", reads: ["s1", "t0"],   writes: ["s1"], hazard: "RAW: s1 ที่ตัวเองเขียนไว้รอบก่อน" },
+  { id: 8,  label: null,    assembly: "addi $t0, $t0, -1",   rs: "t0",   rt: "t0", rd: null, type: "I", reads: ["t0"],         writes: ["t0"], hazard: null },
+  { id: 9,  label: null,    assembly: "j loopN",             rs: null,   rt: null, rd: null, type: "J", reads: [],             writes: [],     target: 6, hazard: "CONTROL: jump ทุกรอบ" },
+
+  // ---------- r! -> $s2 ----------
+  { id: 10, label: "doneN", assembly: "addi $s2, $zero, 1",  rs: "zero", rt: "s2", rd: null, type: "I", reads: ["zero"],       writes: ["s2"], hazard: null },
+  { id: 11, label: null,    assembly: "add $t0, $zero, $a1", rs: "zero", rt: "a1", rd: "t0", type: "R", reads: ["zero", "a1"], writes: ["t0"], hazard: null },
+  { id: 12, label: "loopR", assembly: "beq $t0, $zero, doneR", rs: "t0", rt: "zero", rd: null, type: "I", reads: ["t0", "zero"], writes: [], target: 16, hazard: "CONTROL + RAW: t0 จากคำสั่ง 11 / คำสั่ง 14" },
+  { id: 13, label: null,    assembly: "mul $s2, $s2, $t0",   rs: "s2",   rt: "t0", rd: "s2", type: "R", reads: ["s2", "t0"],   writes: ["s2"], hazard: "RAW: s2 ที่ตัวเองเขียนไว้รอบก่อน" },
+  { id: 14, label: null,    assembly: "addi $t0, $t0, -1",   rs: "t0",   rt: "t0", rd: null, type: "I", reads: ["t0"],         writes: ["t0"], hazard: null },
+  { id: 15, label: null,    assembly: "j loopR",             rs: null,   rt: null, rd: null, type: "J", reads: [],             writes: [],     target: 12, hazard: "CONTROL: jump ทุกรอบ" },
+
+  // ---------- (n-r)! -> $s3 ----------
+  { id: 16, label: "doneR", assembly: "addi $s3, $zero, 1",  rs: "zero", rt: "s3", rd: null, type: "I", reads: ["zero"],       writes: ["s3"], hazard: null },
+  { id: 17, label: null,    assembly: "add $t0, $zero, $s0", rs: "zero", rt: "s0", rd: "t0", type: "R", reads: ["zero", "s0"], writes: ["t0"], hazard: null },
+  { id: 18, label: "loopS", assembly: "beq $t0, $zero, doneS", rs: "t0", rt: "zero", rd: null, type: "I", reads: ["t0", "zero"], writes: [], target: 22, hazard: "CONTROL + RAW: t0 จากคำสั่ง 17 / คำสั่ง 20" },
+  { id: 19, label: null,    assembly: "mul $s3, $s3, $t0",   rs: "s3",   rt: "t0", rd: "s3", type: "R", reads: ["s3", "t0"],   writes: ["s3"], hazard: "RAW: s3 ที่ตัวเองเขียนไว้รอบก่อน" },
+  { id: 20, label: null,    assembly: "addi $t0, $t0, -1",   rs: "t0",   rt: "t0", rd: null, type: "I", reads: ["t0"],         writes: ["t0"], hazard: null },
+  { id: 21, label: null,    assembly: "j loopS",             rs: null,   rt: null, rd: null, type: "J", reads: [],             writes: [],     target: 18, hazard: "CONTROL: jump ทุกรอบ" },
+
+  // ---------- รวมผล: nCr = n! / (r! * (n-r)!) ----------
+  { id: 22, label: "doneS", assembly: "mul $t1, $s2, $s3",   rs: "s2",   rt: "s3", rd: "t1", type: "R", reads: ["s2", "s3"],   writes: ["t1"], hazard: "RAW: s3 จากคำสั่ง 16/19 (ห่างมาก ปกติปลอดภัย)" },
+  { id: 23, label: null,    assembly: "div $s1, $t1",        rs: "s1",   rt: "t1", rd: null, type: "R", reads: ["s1", "t1"],   writes: ["LO", "HI"], hazard: "RAW: t1 จากคำสั่ง 22 (ห่าง 1)" },
+  { id: 24, label: null,    assembly: "mflo $v0",            rs: null,   rt: null, rd: "v0", type: "R", reads: ["LO"],         writes: ["v0"], hazard: "RAW: LO จากคำสั่ง 23 (ห่าง 1)" },
+  { id: 25, label: null,    assembly: "sw $v0, 0($sp)",      rs: "sp",   rt: "v0", rd: null, type: "I", reads: ["sp", "v0"],   writes: [],     hazard: "RAW: v0 จากคำสั่ง 24 (ห่าง 1)" },
+  { id: 26, label: null,    assembly: "lw $t2, 0($sp)",      rs: "sp",   rt: "t2", rd: null, type: "I", reads: ["sp"],         writes: ["t2"], hazard: null },
+  { id: 27, label: null,    assembly: "add $a2, $t2, $zero", rs: "t2",   rt: "zero", rd: "a2", type: "R", reads: ["t2", "zero"], writes: ["a2"], hazard: "LOAD_USE: ใช้ t2 ทันทีหลัง lw (ต้อง stall 1 รอบแม้มี forwarding)" },
+  { id: 28, label: "end",   assembly: "j end",               rs: null,   rt: null, rd: null, type: "J", reads: [],             writes: [],     target: 28, hazard: "CONTROL: จุดจบโปรแกรม (วนอยู่ที่เดิม)" },
+];
+
+// ผลลัพธ์ที่คาดหวังเมื่อรันจนจบ (ใช้เช็คความถูกต้องของ simulator)
+const nCrExpected = { a0: 5, a1: 2, s0: 3, s1: 120, s2: 2, s3: 6, t1: 12, v0: 10, a2: 10 };
+
+</script>
+
+<!-- ===== Game / UI ===== -->
+<script>
+(function () {
+  'use strict';
+  const $ = (s) => document.querySelector(s);
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const ORDER = ['IF', 'ID', 'EX', 'MEM', 'WB'];
+  const FULLNAME = { IF: 'Instruction Fetch', ID: 'Decode / Reg Read', EX: 'Execute / ALU', MEM: 'Memory Access', WB: 'Write Back' };
+  const STAGE_COLOR = { IF: 'var(--c-if)', ID: 'var(--c-id)', EX: 'var(--c-ex)', MEM: 'var(--c-mem)', WB: 'var(--c-wb)' };
+  const SECTIONS = { 1: 'ตั้งค่า n, r และ n−r', 4: 'n! → $s1', 10: 'r! → $s2', 16: '(n−r)! → $s3', 22: 'รวมผล: n! / (r! · (n−r)!)' };
+  const REG_SHOW = ['a0', 'a1', 's0', 's1', 's2', 's3', 't0', 't1', 't2', 'v0', 'a2', 'LO'];
+  const WINDOW = 16;
+  const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  let sim, game, history, rowMeta, alias, flagged, luFlag, lastUids, lastRegs, lastEvents, overlayOpen;
+  // คำสั่ง "j ตัวเอง" (j end) เป็นแค่จุดหยุดโปรแกรม ไม่นับเป็น Control Hazard
+  const HALT_IDS = new Set(nCrProgram.filter((p) => p.target === p.id).map((p) => p.id));
+
+  /* ---------------- เริ่มเกม ---------------- */
+  function newGame() {
+    sim = new PipelineSimulator(nCrProgram, { maxCycles: 400 });
+    game = {
+      score: 0, combo: 0, bestCombo: 0, integrity: 100, over: null, log: [], result: null,
+      cleared: 0, mistakes: 0, wasted: 0,       // Data Hazard ที่แก้สำเร็จ / พลาด (อ่านค่าเก่า) / NOP เสียเปล่า
+      solvedFwd: 0, solvedStall: 0, loadUse: 0, // แก้ด้วยอะไร และมี Load-Use กี่ครั้ง
+      ctrlJump: 0, ctrlBranch: 0,               // Control Hazard: j และ beq ที่ taken
+    };
+    history = []; rowMeta = {}; alias = {}; flagged = new Set(); luFlag = new Set(); lastUids = {}; lastRegs = {}; lastEvents = [];
+    const st = sim.getState();
+    observe(st); record(st, null);
+    addLog(0, 'sys', 'ระบบพร้อม — รัน nCr(5, 2) ให้ได้ $v0 = 10');
+    render(st);
+  }
+
+  /* ---------------- ตัวช่วยเกม ---------------- */
+  function observe(st) {            // จำ consumer ที่เคยเจอ Hazard ไว้ใช้ตัดสินคะแนนตอนมันไปถึง EX
+    if (st.hazard.data.length && !st.pipeline.ID.bubble) {
+      flagged.add(st.pipeline.ID.uid);
+      if (st.hazard.data.some((h) => h.loadUse)) luFlag.add(st.pipeline.ID.uid);
+    }
+  }
+  function blocked() { return !!game.over || overlayOpen; }
+  function addLog(cycle, cls, text) {
+    game.log.unshift({ cycle, cls, text });
+    if (game.log.length > 80) game.log.pop();
+  }
+  const multiplier = () => 1 + Math.min(game.combo, 5) * 0.25;
+
+  /* ---------------- 1 ก้าวของเกม ---------------- */
+  function step(kind) {
+    if (blocked() || sim.status() !== 'RUNNING') return;
+    const before = sim.getState();
+    const exV = before.pipeline.EX;
+    const exUid = exV.bubble ? null : exV.uid;
+    const wastedBefore = sim.stats.wastedStalls;
+
+    if (kind === 'stall') sim.insertStall();
+    const res = sim.nextCycle();
+    const st = res.state;
+    lastEvents = res.events;
+
+    settle(res, exUid, wastedBefore);
+    observe(st);
+    record(st, before);
+    checkEnd(st);
+    render(st);
+  }
+
+  function settle(res, exUid, wastedBefore) {
+    const c = res.cycle;
+    const stale = res.events.filter((e) => e.type === 'STALE_READ');
+    if (exUid != null && luFlag.has(exUid)) game.loadUse++;
+    if (stale.length) {
+      game.mistakes++; game.combo = 0; game.integrity = Math.max(0, game.integrity - 25);
+      game.score = Math.max(0, game.score - 150);
+      const e = stale[0];
+      addLog(c, 'bad', '☠ อ่านค่าเก่า $' + e.reg + ' ที่ "' + e.instruction.assembly + '" — ข้อมูลเสียหาย (−150, ความเสถียร −25%)');
+    } else if (exUid != null && flagged.has(exUid)) {
+      game.cleared++; game.combo++; game.bestCombo = Math.max(game.bestCombo, game.combo);
+      const pts = Math.round(100 * (1 + Math.min(game.combo - 1, 4) * 0.25));
+      game.score += pts;
+      const fw = res.events.find((e) => e.type === 'FORWARD');
+      if (fw) game.solvedFwd++; else game.solvedStall++;
+      addLog(c, 'good', '✔ แก้ Hazard สำเร็จ' + (fw ? ' (Forwarding)' : ' (Stall)') + ' +' + pts + (game.combo > 1 ? '  คอมโบ ×' + game.combo : ''));
+    }
+    const wasted = sim.stats.wastedStalls - wastedBefore;
+    if (wasted > 0) {
+      game.wasted++; game.combo = 0; game.score = Math.max(0, game.score - 25);
+      addLog(c, 'warn', '○ NOP เสียเปล่า — ไม่มี Hazard ให้รอ (−25)');
+    }
+    res.events.forEach((e) => {
+      if (e.type === 'FORWARD') addLog(c, 'info', '⇢ FORWARD ' + e.path + ': $' + e.reg + ' ← "' + e.from.assembly + '"');
+      else if (e.type === 'FLUSH') addLog(c, 'bad', '✖ FLUSH #' + e.instruction.id + ' ' + e.instruction.assembly + ' (ผิดทาง)');
+      else if (e.type === 'CONTROL_HAZARD' && !HALT_IDS.has(e.instruction.id)) {
+        if (e.penalty === 1) game.ctrlJump++; else game.ctrlBranch++;
+        addLog(c, 'warn', '⚡ Control Hazard: ' + e.instruction.assembly + ' — เสีย ' + e.penalty + ' รอบ');
+      }
+      else if (e.type === 'STALL_DROPPED') addLog(c, 'sys', 'NOP ถูกยกเลิก เพราะ pipeline กำลังถูกล้าง');
+    });
+  }
+
+  function checkEnd(st) {
+    if (game.over) return;
+    if (game.integrity <= 0) { game.over = 'CRASH'; return; }
+    if (st.status === 'FINISHED') {
+      const v = sim.verify(nCrExpected);
+      const cyc = st.cycle;
+      const bonus = v.ok ? Math.max(0, (130 - cyc) * 10) : 0;
+      game.score += bonus;
+      const rank = !v.ok ? 'F' : cyc <= 80 ? 'S' : cyc <= 90 ? 'A' : cyc <= 96 ? 'B' : 'C';
+      game.over = 'DONE';
+      game.result = { ok: v.ok, diffs: v.diffs, cycles: cyc, bonus, rank, v0: sim.regs.v0 };
+      addLog(cyc, v.ok ? 'good' : 'bad', v.ok ? '★ จบโปรแกรม: $v0 = 10 ถูกต้อง' : '★ จบโปรแกรม แต่ผลลัพธ์ผิด ($v0 = ' + sim.regs.v0 + ')');
+    } else if (st.status === 'TIMEOUT') {
+      game.over = 'TIMEOUT';
+    }
+  }
+
+  function doForwarding() {
+    if (blocked() || sim.forwarding) return;
+    const r = sim.enableForwarding();
+    const c = sim.cycle;
+    if (r.fixed.length) addLog(c, 'info', '⇢ เปิด Forwarding: แก้ ' + r.fixed.map((h) => '$' + h.reg).join(', ') + ' ได้ทันที');
+    else addLog(c, 'info', '⇢ เปิด Forwarding แล้ว (ยังไม่มี Hazard ที่ต้องแก้ตอนนี้)');
+    if (r.stillNeedsStall) addLog(c, 'warn', 'Load-Use: Forwarding ช่วยไม่ได้ ต้อง Insert Stall อีก ' + r.stallsNeeded + ' ครั้ง');
+    lastEvents = [];
+    render(sim.getState());
+  }
+
+  /* ---------------- ประวัติสำหรับ Pipeline Matrix ---------------- */
+  function record(st, before) {
+    const entry = { cycle: st.cycle, cells: {}, haz: {} };
+    ORDER.forEach((s) => {
+      const v = st.pipeline[s];
+      if (v.bubble && v.kind === 'EMPTY') return;
+      if (!rowMeta[v.uid] && !alias[v.uid]) {
+        if (v.bubble && v.kind === 'FLUSH') {
+          // คำสั่งที่ถูกล้างยังใช้แถวเดิมของมัน (แสดงเป็นลายขีดแดง) ไม่สร้างแถวใหม่
+          const src = before && (s === 'EX' ? before.pipeline.ID : s === 'ID' ? before.pipeline.IF : null);
+          if (src && !src.bubble && rowMeta[src.uid]) alias[v.uid] = src.uid;
+          else rowMeta[v.uid] = { key: v.uid, label: 'NOP (flushed)', kind: 'flushed' };
+        } else if (v.bubble) {
+          const src = before && before.pipeline.ID;
+          rowMeta[v.uid] = { key: (src && !src.bubble ? src.uid : v.uid) - 0.5, label: 'NOP (stall)', kind: 'stall' };
+        } else {
+          rowMeta[v.uid] = { key: v.uid, label: '#' + v.id + '  ' + v.assembly, kind: 'instr' };
+        }
+      }
+      entry.cells[alias[v.uid] || v.uid] = { stage: s, flushed: v.bubble && v.kind === 'FLUSH', stall: v.bubble && v.kind === 'STALL' };
+    });
+    const hz = st.hazard;
+    hz.data.forEach((h) => {
+      const k = h.resolvedByForwarding ? 'fwd' : 'data';
+      if (k === 'data' || !entry.haz[h.consumer.uid]) entry.haz[h.consumer.uid] = k;
+      if (k === 'data' || !entry.haz[h.producer.uid]) entry.haz[h.producer.uid] = k;
+    });
+    if (hz.control) {
+      entry.haz[hz.control.instruction.uid] = 'data';
+      if (!st.pipeline.IF.bubble) entry.haz[st.pipeline.IF.uid] = 'data';
+    }
+    history.push(entry);
+  }
+
+  /* ---------------- Render ---------------- */
+  function render(st) {
+    renderScore(st); renderStatus(st); renderStages(st); renderStrip();
+    renderCode(st); renderMatrix(); renderRegs(st); renderLog(); renderButtons(st); renderOverlay();
+  }
+
+  function setText(id, val) {
+    const el = $(id); const s = String(val);
+    if (el.textContent !== s) { el.textContent = s; el.classList.remove('pop'); void el.offsetWidth; el.classList.add('pop'); }
+  }
+
+  function renderScore(st) {
+    setText('#v-score', game.score);
+    setText('#v-combo', '×' + multiplier().toFixed(1));
+    const bar = $('#bar-int');
+    bar.style.width = game.integrity + '%';
+    bar.className = game.integrity > 60 ? '' : game.integrity > 30 ? 'mid' : 'low';
+    $('#v-int').textContent = game.integrity + '%';
+    $('#v-cycle').textContent = st.cycle;
+    $('#v-cpi').textContent = st.stats.cpi == null ? '–' : st.stats.cpi.toFixed(2);
+    $('#v-stall').textContent = st.stats.stalls;
+    $('#v-flush').textContent = st.stats.flushed;
+    $('#v-fwd').textContent = st.stats.forwards;
+  }
+
+  function hintFor(hz) {
+    if (!$('#hints').checked) return '';
+    const un = hz.data.filter((h) => !h.resolvedByForwarding);
+    if (!un.length) return '';
+    const loadUse = un.some((h) => h.loadUse);
+    if (sim.forwarding) return 'คำแนะนำ: Load-Use ต้องกด Insert Stall (NOP) ' + hz.stallsNeeded + ' ครั้ง แล้วสายลัดจะช่วยต่อ';
+    if (loadUse) return 'คำแนะนำ: Insert Stall (NOP) ' + hz.stallsNeeded + ' ครั้ง หรือเปิด Forwarding แล้ว Stall 1 ครั้ง';
+    return 'คำแนะนำ: เปิด Forwarding (แก้ได้ทันที) หรือ Insert Stall (NOP) ' + hz.stallsNeeded + ' ครั้ง';
+  }
+
+  function renderStatus(st) {
+    const el = $('#status'), t = $('#status-t'), s = $('#status-s');
+    const hz = st.hazard;
+    let cls = 'safe', title = 'ระบบทำงานปกติ (Safe)', lines = [];
+    if (game.over === 'DONE') {
+      cls = 'end'; title = game.result.ok ? 'ภารกิจสำเร็จ — nCr(5, 2) = ' + game.result.v0 : 'จบโปรแกรม แต่ผลลัพธ์ผิด ($v0 = ' + game.result.v0 + ')';
+    } else if (game.over === 'CRASH') {
+      cls = 'danger'; title = 'Pipeline พัง — ความเสถียร 0%';
+    } else if (game.over === 'TIMEOUT') {
+      cls = 'danger'; title = 'โปรแกรมวนไม่จบ (ข้อมูลเพี้ยนเกินไป)';
+    } else if (hz.needsAction) {
+      cls = 'danger'; title = '⚠ เกิด Hazard!';
+      hz.data.filter((h) => !h.resolvedByForwarding).forEach((h) => lines.push(h.message));
+      if (hz.control) lines.push(hz.control.message);
+      const h = hintFor(hz); if (h) lines.push('<span class="hint">' + esc(h) + '</span>');
+    } else if (hz.control) {
+      cls = 'danger'; title = '⚠ เกิด Hazard! (Control)';
+      lines.push(hz.control.message);
+      if ($('#hints').checked) lines.push('<span class="hint">คำแนะนำ: กด Next Cycle ได้เลย ฮาร์ดแวร์ล้างคำสั่งผิดทางให้เอง</span>');
+    } else if (hz.data.length) {
+      lines.push('Forwarding กำลังส่งค่าลัดให้: ' + hz.data.map((h) => '$' + h.reg).join(', '));
+    } else if (st.cycle > 0) {
+      lines.push('ไม่พบ Hazard ใน cycle นี้');
+    } else {
+      lines.push('กด Next Cycle เพื่อเริ่ม fetch คำสั่งแรก');
+    }
+    el.className = 'status ' + cls;
+    t.textContent = title;
+    s.innerHTML = lines.map((l) => (l.indexOf('<span') === 0 ? l : esc(l))).map((l) => '<div>' + l + '</div>').join('');
+  }
+
+  /* ---- 5 ด่านของ Pipeline ---- */
+  function buildStages() {
+    $('#stages').innerHTML = ORDER.map((s) =>
+      '<div class="stage" data-s="' + s + '"><div class="h"><b>' + s + '</b><span>' + FULLNAME[s] + '</span></div>' +
+      '<div class="body"></div><div class="tag"></div><div class="no"></div></div>').join('');
+  }
+  function renderStages(st) {
+    const hz = st.hazard, flag = {};
+    hz.data.forEach((h) => {
+      if (!h.resolvedByForwarding) {
+        flag.ID = { k: 'hz', t: 'RAW $' + h.reg }; flag[h.producerStage] = { k: 'hz', t: 'รอเขียน $' + h.reg };
+      } else {
+        if (!flag[h.producerStage]) flag[h.producerStage] = { k: 'fwd', t: 'FWD $' + h.reg };
+        if (!flag.ID) flag.ID = { k: 'fwd', t: 'รับ FWD' };
+      }
+    });
+    if (hz.control) {
+      if (!flag.ID || flag.ID.k !== 'hz') flag.ID = { k: 'hz', t: 'CONTROL' };
+      if (!st.pipeline.IF.bubble) flag.IF = { k: 'hz', t: 'ผิดทาง?' };
+    }
+    ORDER.forEach((s) => {
+      const el = document.querySelector('.stage[data-s="' + s + '"]');
+      const v = st.pipeline[s];
+      const body = el.querySelector('.body');
+      let cls = 'stage', html = '', no = '';
+      if (v.bubble) {
+        cls += ' bubble';
+        if (v.kind === 'STALL') { cls += ' stallb'; html = '<div class="op">NOP</div><div class="args">stall bubble</div>'; }
+        else if (v.kind === 'FLUSH') { cls += ' flushb'; html = '<div class="op">FLUSH</div><div class="args">' + esc(v.ghost || '') + '</div>'; }
+        else html = '<div class="op">—</div><div class="args">ว่าง</div>';
+      } else {
+        const m = v.assembly.match(/^(\w+)\s*(.*)$/);
+        html = '<div class="op">' + esc(m[1]) + '</div><div class="args">' + esc(m[2]) + '</div>' + (v.corrupted ? '<div class="corrupt">☠ อ่านค่าเก่า</div>' : '');
+        no = '#' + v.id;
+      }
+      const f = flag[s];
+      if (f) cls += ' ' + f.k;
+      el.className = cls;
+      body.innerHTML = html;
+      el.querySelector('.tag').textContent = f ? f.t : '';
+      el.querySelector('.no').textContent = no;
+      if (lastUids[s] !== v.uid && !reduced) { el.classList.add('enter'); }
+      lastUids[s] = v.uid;
+    });
+  }
+
+  function renderStrip() {
+    const chips = [];
+    lastEvents.forEach((e) => {
+      if (e.type === 'FORWARD') chips.push('<span class="chip fwd">FWD ' + e.path + ' → EX · $' + esc(e.reg) + '</span>');
+      else if (e.type === 'FLUSH') chips.push('<span class="chip flush">FLUSH #' + e.instruction.id + '</span>');
+      else if (e.type === 'STALL') chips.push('<span class="chip stall">NOP แทรก' + (e.useful ? '' : ' (เสียเปล่า)') + '</span>');
+      else if (e.type === 'STALE_READ') chips.push('<span class="chip stale">STALE $' + esc(e.reg) + '</span>');
+    });
+    $('#strip').innerHTML = chips.join('');
+  }
+
+  /* ---- รายการโค้ดฝั่งซ้าย ---- */
+  function buildCode() {
+    const list = $('#code-list');
+    let h = '';
+    nCrProgram.forEach((p) => {
+      if (SECTIONS[p.id]) h += '<div class="sec">' + esc(SECTIONS[p.id]) + '</div>';
+      const m = p.assembly.match(/^(\w+)\s*(.*)$/);
+      const args = esc(m[2]).replace(/\$\w+/g, (r) => '<span class="rg">' + r + '</span>');
+      h += '<div class="row" role="listitem" id="row-' + p.id + '"><span class="ptr">▶</span><span class="ln">' + p.id +
+        '</span><span class="lbl">' + (p.label ? esc(p.label) + ':' : '') + '</span><span class="asm"><span class="op">' + esc(m[1]) + '</span> ' + args +
+        '</span><span class="chips"></span></div>';
+    });
+    list.innerHTML = h;
+  }
+  function renderCode(st) {
+    const chips = {}, hazIds = new Set();
+    ORDER.forEach((s) => { const v = st.pipeline[s]; if (!v.bubble) (chips[v.id] = chips[v.id] || []).push(s); });
+    const hz = st.hazard;
+    hz.data.filter((h) => !h.resolvedByForwarding).forEach((h) => { hazIds.add(h.consumer.id); hazIds.add(h.producer.id); });
+    if (hz.control) hazIds.add(hz.control.instruction.id);
+    let nextEl = null;
+    nCrProgram.forEach((p) => {
+      const el = document.getElementById('row-' + p.id);
+      const isNext = st.nextFetchId === p.id && !game.over;
+      el.className = 'row' + (isNext ? ' next' : '') + (hazIds.has(p.id) ? ' haz' : '');
+      el.querySelector('.chips').innerHTML = (chips[p.id] || []).map((s) =>
+        '<i style="color:' + STAGE_COLOR[s] + ';border-color:' + STAGE_COLOR[s] + '">' + s + '</i>').join('');
+      if (isNext) nextEl = el;
+    });
+    $('#fetchnote').textContent = nextEl ? 'ถัดไป: #' + st.nextFetchId : (game.over ? '' : 'หยุด fetch');
+    if (nextEl) {
+      const list = $('#code-list');
+      list.scrollTo({ top: Math.max(0, nextEl.offsetTop - list.clientHeight / 2 + nextEl.offsetHeight / 2), behavior: reduced ? 'auto' : 'smooth' });
+    }
+  }
+
+  /* ---- Pipeline Matrix ---- */
+  function renderMatrix() {
+    const cur = history[history.length - 1].cycle;
+    if (cur < 1) return;
+    const from = Math.max(1, cur - WINDOW + 1);
+    const cols = history.filter((h) => h.cycle >= from);
+    const rowSet = new Set();
+    cols.forEach((h) => Object.keys(h.cells).forEach((u) => rowSet.add(+u)));
+    const rows = [...rowSet].sort((a, b) => rowMeta[a].key - rowMeta[b].key || a - b);
+    let html = '<table class="mx"><thead><tr><th class="lab">คำสั่ง \\ Cycle</th>' +
+      cols.map((h) => '<th class="' + (h.cycle === cur ? 'cur' : '') + '">' + h.cycle + '</th>').join('') + '</tr></thead><tbody>';
+    rows.forEach((u) => {
+      const m = rowMeta[u];
+      const flushedRow = cols.some((h) => h.cells[u] && h.cells[u].flushed);
+      html += '<tr><th class="lab ' + (m.kind === 'stall' ? 'stall' : flushedRow ? 'flushed' : '') + '" title="' + esc(m.label) + '">' + esc(m.label) + '</th>';
+      cols.forEach((h) => {
+        const c = h.cells[u];
+        if (!c) { html += '<td></td>'; return; }
+        let cl = 'cell ' + c.stage, txt = c.stage;
+        if (c.flushed) { cl = 'cell flushed'; txt = '✖'; }
+        else if (c.stall) { cl = 'cell stalled'; txt = 'NOP'; }
+        const hz = h.haz[u];
+        if (hz === 'data') cl += h.cycle === cur ? ' hz-now' : ' hz-past';
+        else if (hz === 'fwd') cl += ' fwdc';
+        html += '<td><div class="' + cl + '">' + txt + '</div></td>';
+      });
+      html += '</tr>';
+    });
+    $('#matrix').innerHTML = html + '</tbody></table>';
+    const wrap = $('#matrix-wrap');
+    wrap.scrollLeft = wrap.scrollWidth;
+    wrap.scrollTop = wrap.scrollHeight;
+  }
+
+  /* ---- Register / Log ---- */
+  function buildRegs() {
+    $('#regs').innerHTML = REG_SHOW.map((r) => '<div class="reg" id="reg-' + r + '"><span>$' + r.toLowerCase() + '</span><b>0</b></div>').join('');
+  }
+  function renderRegs(st) {
+    REG_SHOW.forEach((r) => {
+      const el = document.getElementById('reg-' + r), v = st.regs[r] || 0;
+      el.querySelector('b').textContent = v;
+      if (lastRegs[r] !== undefined && lastRegs[r] !== v) { el.classList.remove('changed'); void el.offsetWidth; el.classList.add('changed'); }
+      lastRegs[r] = v;
+    });
+  }
+  function renderLog() {
+    $('#log').innerHTML = game.log.slice(0, 40).map((l) => '<div class="' + l.cls + '"><span class="c">C' + l.cycle + '</span>' + esc(l.text) + '</div>').join('');
+  }
+
+  function renderButtons(st) {
+    const off = blocked() || st.status !== 'RUNNING';
+    $('#btn-next').disabled = off;
+    $('#btn-stall').disabled = off;
+    const fb = $('#btn-fwd');
+    fb.disabled = off || sim.forwarding;
+    fb.classList.toggle('on', sim.forwarding);
+    fb.firstChild.nodeValue = sim.forwarding ? 'Forwarding: เปิดอยู่' : 'Enable Forwarding';
+  }
+
+  /* ---- Overlay ---- */
+  function showHow() {
+    overlayOpen = true;
+    $('#overlay').className = 'show';
+    $('#ov-box').innerHTML =
+      '<h2 id="ov-title" class="big" style="color:var(--neon)">วิธีเล่น</h2>' +
+      '<p class="mt-2" style="color:var(--dim)">คุณคือหน่วยควบคุม Pipeline: เดิน clock ทีละรอบ และแก้ Hazard ก่อนที่ข้อมูลจะเสีย</p>' +
+      '<ul class="how mt-3 text-sm">' +
+      '<li><b>Next Cycle</b> — เดินหน้า 1 clock ถ้ามี Data Hazard ค้างอยู่ คำสั่งจะอ่านค่าเก่า (−150 คะแนน, ความเสถียร −25%)</li>' +
+      '<li><b class="a">Insert Stall (NOP)</b> — แทรกฟองอากาศ 1 ตัวแล้วเดิน clock ใช้เมื่อต้องรอผลของคำสั่งก่อนหน้า ถ้าไม่มี Hazard จะเสียคะแนน (−25)</li>' +
+      '<li><b class="c">Enable Forwarding</b> — เปิดสายลัดถาวร แก้ Hazard ของคำสั่งคำนวณได้ทันที แต่ <b>Load-Use</b> (lw แล้วใช้ค่าทันที) ยังต้อง Stall 1 ครั้ง</li>' +
+      '<li><b class="r">Control Hazard</b> (j, beq) — ฮาร์ดแวร์ล้างคำสั่งผิดทางให้เอง กด Next Cycle ได้เลย แต่เสียเวลา 1–2 รอบ</li>' +
+      '</ul>' +
+      '<p class="mt-3 text-sm" style="color:var(--dim)">แก้ Hazard ถูกต้องได้ +100 ต่อเนื่องได้คอมโบสูงสุด ×2.25 จบโปรแกรมด้วย $v0 = 10 โดย Pipeline ไม่พัง (ความเสถียรไม่ถึง 0%) คือชนะ ยิ่งใช้ cycle น้อยยิ่งได้โบนัสและแรงก์สูง (S ≤ 80 cycle) · คะแนนไม่ติดลบ ต่ำสุดคือ 0</p>' +
+      '<p class="mt-2 text-xs code" style="color:var(--dim)">คีย์ลัด: N = Next Cycle · S = Insert Stall · F = Enable Forwarding</p>' +
+      '<button class="btn next mt-4 w-full" id="ov-go">เริ่มเล่น</button>';
+    $('#ov-go').onclick = closeOverlay; $('#ov-go').focus();
+  }
+  function closeOverlay() { overlayOpen = false; $('#overlay').className = ''; render(sim.getState()); }
+
+  function renderOverlay() {
+    if (!game.over || overlayOpen) return;
+    overlayOpen = true;
+    const ov = $('#overlay');
+    let html;
+    if (game.over === 'DONE' && game.result.ok) {
+      ov.className = 'show win';
+      html = winHtml();
+    } else if (game.over === 'DONE') {
+      const r = game.result;
+      ov.className = 'show' + (r.ok ? '' : ' bad');
+      const col = r.rank === 'S' ? 'var(--neon)' : r.rank === 'F' ? '#ff5a78' : r.rank === 'A' ? 'var(--cyan)' : 'var(--amber)';
+      html = '<h2 id="ov-title" class="big" style="color:' + col + '">' + (r.ok ? 'ภารกิจสำเร็จ' : 'ผลลัพธ์ผิด') + '</h2>' +
+        '<div class="flex items-center gap-6 mt-3"><div class="rank" style="color:' + col + ';text-shadow:0 0 24px ' + col + '">' + r.rank + '</div>' +
+        '<div class="code text-sm" style="line-height:1.8">$v0 = <b>' + r.v0 + '</b> (เป้าหมาย 10)<br>รวม <b>' + r.cycles + '</b> cycle · CPI <b>' + (r.cycles / sim.stats.retired).toFixed(2) + '</b><br>' +
+        'คำสั่งที่เสร็จ ' + sim.stats.retired + ' · Stall ' + sim.stats.stalls + ' · Flush ' + sim.stats.flushed + ' · Forward ' + sim.stats.forwards + '<br>' +
+        'แก้ Hazard สำเร็จ ' + game.cleared + ' · พลาด ' + game.mistakes + ' · NOP เสียเปล่า ' + game.wasted + '</div></div>' +
+        '<div class="mt-3 text-sm">คะแนนรวม <b style="color:var(--neon);font-size:1.4rem">' + game.score + '</b> <span style="color:var(--dim)">(โบนัสความเร็ว +' + r.bonus + ')</span></div>' +
+        '<p class="mt-2 text-xs" style="color:var(--dim)">เกณฑ์แรงก์: S ≤ 80 · A ≤ 90 · B ≤ 96 · C มากกว่านั้น · F ผลลัพธ์ผิด</p>';
+    } else {
+      ov.className = 'show bad';
+      html = '<h2 id="ov-title" class="big" style="color:#ff5a78">' + (game.over === 'CRASH' ? 'Pipeline พัง' : 'โปรแกรมวนไม่จบ') + '</h2>' +
+        '<p class="mt-2 text-sm">' + (game.over === 'CRASH'
+          ? 'อ่านค่าเก่าเกินไป 4 ครั้ง ข้อมูลใน register เสียหายจนรันต่อไม่ได้ ลองดู Hazard สีแดงก่อนกด Next Cycle'
+          : 'ค่าในลูปเพี้ยนจนโปรแกรมไม่จบภายใน 400 cycle') + '</p>' +
+        '<p class="mt-2 text-sm code" style="color:var(--dim)">คะแนน ' + game.score + ' · cycle ' + sim.cycle + '</p>';
+    }
+    html += '<button class="btn next mt-4 w-full" id="ov-again">เล่นอีกครั้ง</button>';
+    $('#ov-box').innerHTML = html;
+    $('#ov-again').onclick = () => { overlayOpen = false; $('#overlay').className = ''; newGame(); };
+    $('#ov-again').focus();
+    if (game.over === 'DONE' && game.result.ok) burst();
+  }
+
+  /* ---- หน้าต่างแสดงความยินดี: CPU คำนวณ nCr สำเร็จ ---- */
+  function winHtml() {
+    const r = game.result, st = sim.stats;
+    const dataTotal = game.cleared + game.mistakes;           // Data Hazard ที่ถูกประมวลผลจริง (ไม่นับคำสั่งผิดทางที่ถูกล้าง)
+    const ctrlTotal = game.ctrlJump + game.ctrlBranch;
+    const rate = dataTotal ? Math.round((100 * game.cleared) / dataTotal) : 100;
+    const ideal = st.retired + 4;                              // CPI = 1: คำสั่งทั้งหมด + 4 รอบเติม pipeline
+    const eff = Math.round((100 * ideal) / r.cycles);
+    const usefulStalls = st.stalls - st.wastedStalls;
+    const col = { S: 'var(--neon)', A: 'var(--cyan)', B: 'var(--amber)', C: 'var(--amber)' }[r.rank];
+    const verdict = {
+      S: 'ยอดเยี่ยม — ทำได้เท่าค่าต่ำสุดที่เป็นไปได้ในโมเดลนี้ (80 cycle) รู้ว่าเมื่อไรควรเปิด Forwarding และเมื่อไรต้อง Stall',
+      A: 'ดีมาก — ใกล้ค่าที่ดีที่สุด เสียรอบเพิ่มเล็กน้อยจาก NOP ที่เกินจำเป็นหรือการเปิด Forwarding ช้า',
+      B: 'ผ่านดี — แก้ Hazard ได้ถูกต้อง แต่ใช้ Stall เยอะ ลองเปิด Forwarding เร็วขึ้นเพื่อลดรอบที่เสีย',
+      C: 'ผ่าน — คำนวณถูกต้อง แต่เสียรอบจาก Stall และ NOP เสียเปล่าค่อนข้างมาก',
+    }[r.rank];
+    const meter = (pct, c) => '<div class="meter"><i style="width:' + pct + '%;background:' + c + ';box-shadow:0 0 10px ' + c + '"></i></div>';
+    return '<div class="text-center"><h2 id="ov-title" class="win-title">CPU คำนวณค่า nCr สำเร็จ! <br>เกรด A เป็นของคุณ!</h2>' +
+      '<p class="code text-sm mt-3" style="color:var(--dim)">nCr(5, 2) → $v0 = <b style="color:var(--neon)">' + r.v0 + '</b> ถูกต้อง · Pipeline ไม่พัง (ความเสถียร ' + game.integrity + '%)</p></div>' +
+      '<div class="grid gap-3 mt-4 sm:grid-cols-3">' +
+        // การ์ด 1: จำนวน Hazard
+        '<div class="card"><div class="ck">Hazard ที่เกิดขึ้น</div><div class="cv">' + (dataTotal + ctrlTotal) + ' <small>ครั้ง</small></div>' +
+        '<div class="cl"><span>Data Hazard</span><b>' + dataTotal + '</b></div>' +
+        '<div class="cl sub"><span>ในนั้น Load-Use</span><b>' + game.loadUse + '</b></div>' +
+        '<div class="cl"><span>Control Hazard</span><b>' + ctrlTotal + '</b></div>' +
+        '<div class="cl sub"><span>j · beq ที่ taken</span><b>' + game.ctrlJump + ' · ' + game.ctrlBranch + '</b></div></div>' +
+        // การ์ด 2: แก้ได้ดีแค่ไหน
+        '<div class="card"><div class="ck">แก้ Data Hazard ได้ดีแค่ไหน</div><div class="cv">' + rate + '<small>%</small></div>' + meter(rate, rate === 100 ? 'var(--neon)' : rate >= 75 ? 'var(--amber)' : 'var(--red)') +
+        '<div class="cl"><span>แก้ด้วย Forwarding</span><b>' + game.solvedFwd + '</b></div>' +
+        '<div class="cl"><span>แก้ด้วย Stall</span><b>' + game.solvedStall + '</b></div>' +
+        '<div class="cl"><span>พลาด (อ่านค่าเก่า)</span><b style="color:' + (game.mistakes ? '#ff5a78' : 'inherit') + '">' + game.mistakes + '</b></div>' +
+        '<div class="cl"><span>NOP เสียเปล่า · คอมโบสูงสุด</span><b>' + st.wastedStalls + ' · ×' + game.bestCombo + '</b></div></div>' +
+        // การ์ด 3: ประสิทธิภาพ
+        '<div class="card"><div class="ck">ประสิทธิภาพ Pipeline</div><div class="cv" style="color:' + col + '">' + r.rank + ' <small>' + r.cycles + ' cycle</small></div>' + meter(eff, col) +
+        '<div class="cl"><span>เทียบกับไม่มี Hazard (' + ideal + ')</span><b>' + eff + '%</b></div>' +
+        '<div class="cl"><span>CPI</span><b>' + (r.cycles / st.retired).toFixed(2) + '</b></div>' +
+        '<div class="cl"><span>รอบที่เสียจาก Control</span><b>' + st.flushed + '</b></div>' +
+        '<div class="cl"><span>รอบที่เสียจาก Stall</span><b>' + usefulStalls + (st.wastedStalls ? ' + ' + st.wastedStalls + ' เสียเปล่า' : '') + '</b></div></div>' +
+      '</div>' +
+      '<p class="mt-4 text-sm">' + verdict + '</p>' +
+      '<div class="mt-3 text-sm">คะแนนรวม <b style="color:var(--neon);font-size:1.5rem">' + game.score + '</b> <span style="color:var(--dim)">(โบนัสความเร็ว +' + r.bonus + ')</span></div>' +
+      '<p class="mt-2 text-xs" style="color:var(--dim)">นับ Control Hazard เฉพาะ j และ beq ที่ taken เพราะเป็นกรณีที่เสียรอบจริง · เกณฑ์แรงก์: S ≤ 80 · A ≤ 90 · B ≤ 96 · C มากกว่านั้น</p>';
+  }
+
+  /* ---- confetti นีออน (เล่นครั้งเดียวตอนชนะ, ข้ามถ้าผู้ใช้ปิดแอนิเมชัน) ---- */
+  function burst() {
+    if (reduced) return;
+    const cv = $('#fx'), ctx = cv.getContext('2d');
+    cv.width = window.innerWidth; cv.height = window.innerHeight;
+    const colors = ['#39ff14', '#00e5ff', '#ffc400', '#c77dff', '#ffffff'];
+    const ps = [];
+    for (let i = 0; i < 170; i++) {
+      ps.push({ x: cv.width / 2 + (Math.random() - 0.5) * 240, y: cv.height * 0.42,
+        vx: (Math.random() - 0.5) * 16, vy: -Math.random() * 15 - 3, s: 4 + Math.random() * 6,
+        c: colors[(Math.random() * colors.length) | 0], a: Math.random() * 6, va: (Math.random() - 0.5) * 0.4 });
+    }
+    let f = 0;
+    (function frame() {
+      ctx.clearRect(0, 0, cv.width, cv.height);
+      ps.forEach((p) => {
+        p.vy += 0.32; p.vx *= 0.995; p.x += p.vx; p.y += p.vy; p.a += p.va;
+        ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.a);
+        ctx.globalAlpha = Math.max(0, 1 - f / 200); ctx.fillStyle = p.c; ctx.shadowColor = p.c; ctx.shadowBlur = 8;
+        ctx.fillRect(-p.s / 2, -p.s / 4, p.s, p.s / 2); ctx.restore();
+      });
+      if (++f < 200) requestAnimationFrame(frame); else ctx.clearRect(0, 0, cv.width, cv.height);
+    })();
+  }
+
+  /* ---------------- Events ---------------- */
+  $('#btn-next').onclick = () => step('next');
+  $('#btn-stall').onclick = () => step('stall');
+  $('#btn-fwd').onclick = doForwarding;
+  $('#btn-restart').onclick = () => { if (!overlayOpen) newGame(); };
+  $('#btn-how').onclick = showHow;
+  $('#hints').onchange = () => render(sim.getState());
+  document.addEventListener('keydown', (e) => {
+    if (e.ctrlKey || e.metaKey || e.altKey || overlayOpen) return;
+    const k = e.key.toLowerCase();
+    if (k === 'n') step('next'); else if (k === 's') step('stall'); else if (k === 'f') doForwarding();
+  });
+
+  buildStages(); buildCode(); buildRegs();
+  overlayOpen = false;
+  newGame();
+
+  // ให้ฝั่งทดสอบ/ดีบั๊กเข้าถึง state ได้ (ไม่กระทบเกม)
+  window.__game = { get sim() { return sim; }, get state() { return game; } };
+})();
+</script>
+<script>
+  (function () {
+    const slides = Array.from(document.querySelectorAll('[data-tutorial-slide]'));
+    let current = 0;
+    function showSlide(index) {
+      current = Math.max(0, Math.min(index, slides.length - 1));
+      slides.forEach((slide, i) => slide.classList.toggle('active', i === current));
+    }
+    document.querySelectorAll('[data-tutorial-next]').forEach((button) => button.addEventListener('click', () => showSlide(current + 1)));
+    document.getElementById('start-game-btn').addEventListener('click', () => {
+      document.getElementById('tutorial-container').style.display = 'none';
+      document.getElementById('game-container').style.display = 'block';
+      document.getElementById('btn-next').focus();
+    });
+  })();
+</script>
+</body>
+</html>
