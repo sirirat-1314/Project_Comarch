@@ -1063,6 +1063,9 @@ table.mx td {
   gap: 1rem;
   align-content: center;
 }
+.tutorial-grid.four {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
 .tutorial-card {
   padding: 1.1rem;
   border: 1px solid var(--line);
@@ -1146,6 +1149,7 @@ table.mx td {
 }
 @media (max-width: 720px) {
   .tutorial-grid,
+  .tutorial-grid.four,
   .pipeline-flow {
     grid-template-columns: 1fr;
   }

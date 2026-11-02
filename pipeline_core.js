@@ -16,10 +16,15 @@
  *    ดังนั้น Data Hazard เกิดเมื่อ producer อยู่ที่ EX หรือ MEM ขณะที่ consumer อยู่ ID
  *  - Forwarding ต่อเข้า "อินพุตของ EX" จาก 2 สาย: EX/MEM (producer อยู่ MEM) และ MEM/WB (producer อยู่ WB)
  *    ถ้า producer เป็น lw ที่ยังอยู่ EX ข้อมูลยังไม่ออกจาก memory => forward ไม่ทัน ต้อง stall 1 รอบ (Load-Use)
- *  - Control Hazard: ไม่มี branch prediction (fetch ตามลำดับเสมอ)
- *      j   รู้ปลายทางที่ ID  => คำสั่งที่ถูก fetch ผิดทาง 1 คำสั่งถูกล้าง (penalty 1 cycle)
- *      beq ตัดสินที่ EX      => ถ้า taken ล้างคำสั่งผิดทาง 2 คำสั่ง (penalty 2 cycles)
+ *  - Control Hazard: Predict Not Taken (fetch คำสั่งถัดไปเสมอ) + ย้ายการตัดสิน branch มาที่ ID
+ *    (ตามสไลด์ Pipelining หน้า 14-17, 59-61 และ COA Notes 5.1.3)
+ *      j   รู้ปลายทางที่ ID          => ล้างคำสั่งที่ fetch ผิดทาง 1 คำสั่ง (penalty 1 cycle)
+ *      beq เทียบ register ที่ ID     => ถ้า taken ล้าง 1 คำสั่ง (penalty 1 cycle), not taken ไม่เสียรอบ
  *    การล้าง (flush) เป็นฮาร์ดแวร์อัตโนมัติ ผู้เล่นไม่ต้องกดอะไร แต่ถูกนับเป็นรอบที่เสียไป
+ *  - Data Hazard ของ branch (สไลด์หน้า 62-64): beq ต้องใช้ค่าตั้งแต่ ID ซึ่งเร็วกว่า EX 1 stage
+ *      producer เป็น ALU ที่อยู่ก่อนหน้า 2 คำสั่งขึ้นไป  => forward EX/MEM -> ID ได้ ไม่ต้อง stall
+ *      producer เป็น ALU ที่อยู่ติดกัน หรือ lw ห่าง 2      => stall 1 รอบ แม้เปิด forwarding
+ *      producer เป็น lw ที่อยู่ติดกัน                    => stall 2 รอบ แม้เปิด forwarding
  *  - "j <ตัวเอง>" (เช่น  end: j end) ถือเป็นจุดจบโปรแกรม (HALT) ไม่วนไม่รู้จบ
  * ===================================================================== */
 (function (root) {
@@ -185,8 +190,9 @@
     checkHazard() {
       const id = this.pipe.ID;
       const report = { cycle: this.cycle, data: [], control: null,
-        stallsNeeded: 0, needsAction: false, hasHazard: false };
+        stallsNeeded: 0, stallsWithForwarding: 0, needsAction: false, hasHazard: false };
       if (id.bubble) return report;
+      const isBranch = id.ins.isBranch;              // beq ใช้ค่าตั้งแต่ ID ไม่ใช่ EX
 
       for (const reg of new Set(id.ins.reads)) {      // Set: add $t1,$t0,$t0 นับ $t0 ครั้งเดียว
         if (reg === ZERO) continue;
@@ -198,33 +204,40 @@
         }
         if (!producer) continue;
 
-        const loadUse = producer.ins.isLoad && stage === 'EX';
-        const fixedByForwarding = this.forwarding && !loadUse;
-        let stallsNeeded;
-        if (fixedByForwarding) stallsNeeded = 0;
-        else if (this.forwarding) stallsNeeded = 1;          // Load-Use: ต้องรอให้ lw ไปอยู่ MEM ก่อนจึง forward ได้
-        else stallsNeeded = stage === 'EX' ? 2 : 1;          // ไม่มีสายลัด: ต้องรอจน producer ถึง WB
+        const isLoad = producer.ins.isLoad;
+        // จำนวน stall เมื่อเปิดสายลัด
+        //  - ALU/lw ปกติ: สายลัดเข้า EX  -> ติดแค่ Load-Use (lw อยู่ EX) 1 รอบ
+        //  - beq: สายลัด EX/MEM -> ID ได้เฉพาะผลของ ALU ที่อยู่ MEM แล้ว (สไลด์หน้า 62-64)
+        let withFwd;
+        if (isBranch) withFwd = stage === 'EX' ? (isLoad ? 2 : 1) : (isLoad ? 1 : 0);
+        else withFwd = stage === 'EX' && isLoad ? 1 : 0;
+        const withoutFwd = stage === 'EX' ? 2 : 1;           // ไม่มีสายลัด: ต้องรอจน producer ถึง WB
+        const stallsNeeded = this.forwarding ? withFwd : withoutFwd;
+        const loadUse = isLoad && withFwd > 0;
+        const fixedByForwarding = this.forwarding && withFwd === 0;
 
+        const kind = isBranch ? (loadUse ? 'Branch + Load-Use: ' : 'Branch: ') : loadUse ? 'Load-Use: ' : 'RAW: ';
         report.data.push({
-          type: 'RAW', reg, producerStage: stage, loadUse,
+          type: 'RAW', reg, producerStage: stage, loadUse, branchCompare: isBranch,
           producer: brief(producer), consumer: brief(id),
-          resolvedByForwarding: fixedByForwarding, stallsNeeded,
-          message: (loadUse ? 'Load-Use: ' : 'RAW: ') + '$' + reg + ' จาก "' + producer.ins.assembly +
-            '" (อยู่ที่ ' + stage + ') ยังเขียนไม่เสร็จ',
+          resolvedByForwarding: fixedByForwarding, stallsNeeded, stallsWithForwarding: withFwd,
+          message: kind + '$' + reg + ' จาก "' + producer.ins.assembly + '" (อยู่ที่ ' + stage + ') ยังเขียนไม่เสร็จ' +
+            (isBranch ? ' — beq เทียบค่าที่ ID' : ''),
         });
         report.stallsNeeded = Math.max(report.stallsNeeded, stallsNeeded);
+        report.stallsWithForwarding = Math.max(report.stallsWithForwarding, withFwd);
       }
 
-      if (id.ins.isJump || id.ins.isBranch) {
+      if (id.ins.isJump || isBranch) {
         report.control = {
           type: 'CONTROL', kind: id.ins.isJump ? 'JUMP' : 'BRANCH',
           instruction: brief(id),
-          resolveStage: id.ins.isJump ? 'ID' : 'EX',
-          penaltyCycles: id.ins.isJump ? 1 : 2,      // beq: จ่ายก็ต่อเมื่อ taken
-          certain: id.ins.isJump,                     // j แน่นอนว่ากระโดด, beq รู้ผลตอน EX
+          resolveStage: 'ID',
+          penaltyCycles: 1,                           // beq: จ่ายก็ต่อเมื่อ taken (Predict Not Taken)
+          certain: id.ins.isJump,                     // j แน่นอนว่ากระโดด, beq รู้ผลเมื่อเทียบ register ที่ ID
           message: id.ins.isJump
             ? 'Control: "' + id.ins.assembly + '" กระโดดเสมอ คำสั่งที่ fetch ไว้ผิดทางจะถูกล้าง (เสีย 1 รอบ)'
-            : 'Control: "' + id.ins.assembly + '" รู้ผลตอน EX ถ้า taken จะล้างคำสั่งผิดทาง 2 คำสั่ง (เสีย 2 รอบ)',
+            : 'Control: "' + id.ins.assembly + '" เดาว่าไม่กระโดด (Predict Not Taken) ถ้า taken จะล้างคำสั่งผิดทาง 1 คำสั่ง (เสีย 1 รอบ)',
         };
       }
 
@@ -245,8 +258,8 @@
       return { ok: true, queued: this.stallRequests, useful: r.stallsNeeded > 0, report: r };
     }
 
-    /** เปิดสายลัด EX/MEM และ MEM/WB -> อินพุตของ EX
-     *  แก้ RAW ที่เกิดจากคำสั่ง ALU ได้ทันที แต่ Load-Use ยังต้อง stall 1 รอบ */
+    /** เปิดสายลัด EX/MEM และ MEM/WB -> อินพุตของ EX (และ EX/MEM -> ตัวเทียบของ beq ที่ ID)
+     *  แก้ RAW ที่เกิดจากคำสั่ง ALU ได้ทันที แต่ Load-Use และ beq ที่ใช้ค่าจากคำสั่งติดกันยังต้อง stall */
     enableForwarding() {
       const already = this.forwarding;
       this.forwarding = true;
@@ -265,6 +278,7 @@
      *   EX -> MEM -> WB -> ID -> IF
      *   - EX ทำก่อน MEM เพื่อให้ lw ที่ยังอยู่ MEM "ยังไม่มีข้อมูล" ให้ forward (ตรงกับฮาร์ดแวร์จริง)
      *   - WB เขียน register ก่อน ID อ่าน (เขียนครึ่งแรก / อ่านครึ่งหลัง)
+     *   - j / beq ตัดสินที่ ID ถ้ากระโดดจะล้างคำสั่งใน IF 1 คำสั่ง
      * ================================================================= */
     nextCycle() {
       if (this.status() !== 'RUNNING') return this._result([]);
@@ -278,29 +292,23 @@
       if (this.stallRequests > 0) { this.stallRequests--; stall = true; stallSource = 'PLAYER'; }
       else if (this.autoInterlock && report.stallsNeeded > 0) { stall = true; stallSource = 'AUTO'; }
 
-      // --- EX: เลือก operand (forward ถ้าเปิดสายลัด) แล้วคำนวณ / ตัดสิน beq ---
-      let exRedirect = null;
-      if (!cur.EX.bubble) {
-        this._execute(cur.EX, cur, events);
-        if (cur.EX.ins.isBranch && cur.EX.taken) exRedirect = cur.EX.ins.targetIndex;
-      }
+      // --- EX: เลือก operand (forward ถ้าเปิดสายลัด) แล้วคำนวณ ---
+      if (!cur.EX.bubble) this._execute(cur.EX, cur, events);
       // --- MEM / WB ---
       if (!cur.MEM.bubble) this._memory(cur.MEM);
       if (!cur.WB.bubble) this._writeBack(cur.WB);
 
-      // beq taken: ID/IF เป็นคำสั่งผิดทางอยู่แล้ว การ stall ไม่มีความหมาย
-      if (exRedirect !== null && stall) {
-        stall = false;
-        events.push({ type: 'STALL_DROPPED', cycle: this.cycle });
-      }
-
-      // --- ID: อ่าน register file (เฉพาะเมื่อคำสั่งเดินต่อ) + ตัดสิน j ---
-      let idRedirect = null;
-      if (exRedirect === null && !stall && !cur.ID.bubble) {
+      // --- ID: อ่าน register file (เฉพาะเมื่อคำสั่งเดินต่อ) + ตัดสิน j / beq ---
+      let redirect = null;
+      if (!stall && !cur.ID.bubble) {
         const id = cur.ID;
         for (const r of id.ins.reads) id.operands[r] = r === ZERO ? 0 : (this.regs[r] || 0);
-        if (id.ins.isJump) {
-          idRedirect = id.ins.targetIndex;
+        if (id.ins.isBranch) {
+          this._resolveBranch(id, cur, events);
+          if (id.taken) redirect = id.ins.targetIndex;
+        } else if (id.ins.isJump) {
+          id.taken = true;
+          redirect = id.ins.targetIndex;
           if (id.ins.target === id.ins.id) this.fetchStopped = true;   // j ตัวเอง = HALT
         }
       }
@@ -312,28 +320,22 @@
         if (!useful) this.stats.wastedStalls++;
         events.push({ type: 'STALL', cycle: this.cycle, source: stallSource, useful });
       }
-      if (report.control && exRedirect === null && idRedirect !== null) {
-        events.push({ type: 'CONTROL_HAZARD', cycle: this.cycle, instruction: report.control.instruction, penalty: 1 });
+      if (redirect !== null) {
+        events.push({ type: 'CONTROL_HAZARD', cycle: this.cycle, kind: report.control.kind,
+          instruction: report.control.instruction, penalty: 1 });
       }
 
       // --- เลื่อน pipeline ---
       const next = { WB: cur.MEM, MEM: cur.EX };
-      if (exRedirect !== null) {
-        // beq taken ที่ EX: ล้าง ID และ IF (penalty 2)
-        events.push({ type: 'CONTROL_HAZARD', cycle: this.cycle, instruction: brief(cur.EX), penalty: 2 });
-        next.EX = this._squash(cur.ID, events);
-        next.ID = this._squash(cur.IF, events);
-        this.pc = exRedirect;
-        next.IF = this._fetch();
-      } else if (stall) {
+      if (stall) {
         next.EX = this._bubble('STALL');
         next.ID = cur.ID;           // ค้างไว้
         next.IF = cur.IF;           // ค้างไว้ (PC ไม่ขยับ)
       } else {
         next.EX = cur.ID;
-        if (idRedirect !== null) {  // j: ล้างคำสั่งที่ fetch ผิดทางใน IF (penalty 1)
+        if (redirect !== null) {    // j / beq taken: ล้างคำสั่งที่ fetch ผิดทางใน IF (penalty 1)
           next.ID = this._squash(cur.IF, events);
-          this.pc = idRedirect;
+          this.pc = redirect;
         } else {
           next.ID = cur.IF;
         }
@@ -366,6 +368,7 @@
     /* ---------- EX ---------- */
     _execute(inst, cur, events) {
       const ins = inst.ins;
+      if (ins.isBranch || ins.isJump) return;    // ตัดสินไปแล้วที่ ID
       const v = {};                              // ค่า operand ที่ใช้จริง
       for (const reg of ins.reads) {
         if (reg === ZERO) { v[reg] = 0; continue; }
@@ -379,7 +382,7 @@
             value = prod.results[reg];
             this.stats.forwards++;
             events.push({ type: 'FORWARD', cycle: this.cycle, reg,
-              path: prod === cur.MEM ? 'EX/MEM' : 'MEM/WB',
+              path: prod === cur.MEM ? 'EX/MEM' : 'MEM/WB', dest: 'EX',
               from: brief(prod), to: brief(inst) });
           } else {
             inst.corrupted = true;
@@ -404,9 +407,38 @@
         case 'mflo': inst.results[ins.rd] = v.LO; break;
         case 'lw':   inst.addr = (v[ins.rs] + ins.imm) | 0; break;           // ข้อมูลมาตอน MEM
         case 'sw':   inst.addr = (v[ins.rs] + ins.imm) | 0; inst.storeValue = v[ins.rt]; break;
-        case 'beq':  inst.taken = v[ins.rs] === v[ins.rt]; break;
-        case 'j':    inst.taken = true; break;
       }
+    }
+
+    /* ---------- ID: ตัวเทียบของ beq ----------
+     * เรียกหลัง EX/MEM/WB ของ clock นี้ทำงานแล้ว แต่ในฮาร์ดแวร์จริงผลที่ ID ใช้ได้มีแค่
+     *  - register file (WB เขียนครึ่งแรกไปแล้ว)
+     *  - สายลัด EX/MEM -> ID: ผลของ ALU ที่คำนวณเสร็จตั้งแต่ clock ก่อน (ตอนนี้อยู่ MEM)
+     * ผลของคำสั่งที่อยู่ EX ตอนนี้ หรือ lw ที่กำลังอ่าน memory ยังมาไม่ทัน */
+    _resolveBranch(inst, cur, events) {
+      const ins = inst.ins;
+      const v = {};
+      for (const reg of ins.reads) {
+        if (reg === ZERO) { v[reg] = 0; continue; }
+        let value = inst.operands[reg];
+        const prod = this._findProducer(reg, [cur.EX, cur.MEM]);
+        if (prod) {
+          if (this.forwarding && prod === cur.MEM && !prod.ins.isLoad) {
+            value = prod.results[reg];
+            this.stats.forwards++;
+            events.push({ type: 'FORWARD', cycle: this.cycle, reg, path: 'EX/MEM', dest: 'ID',
+              from: brief(prod), to: brief(inst) });
+          } else {
+            inst.corrupted = true;
+            this.stats.staleReads++;
+            events.push({ type: 'STALE_READ', cycle: this.cycle, reg,
+              reason: !this.forwarding ? 'NO_FORWARDING' : prod.ins.isLoad ? 'LOAD_USE' : 'BRANCH_IN_ID',
+              instruction: brief(inst), producer: brief(prod) });
+          }
+        }
+        v[reg] = value;
+      }
+      inst.taken = v[ins.rs] === v[ins.rt];
     }
 
     _findProducer(reg, stageInsts) {
@@ -483,7 +515,7 @@
         ghost: inst.ghost ? inst.ghost.assembly : null };   // ghost = คำสั่งที่ถูกล้าง (ไว้ทำเอฟเฟกต์)
     }
     return { bubble: false, uid: inst.uid, id: inst.ins.id, assembly: inst.ins.assembly,
-      corrupted: inst.corrupted };
+      isBranch: inst.ins.isBranch, corrupted: inst.corrupted };
   }
 
   const api = { PipelineSimulator, decodeInstruction, STAGES, PIPELINE_STAGE_GUIDE };
